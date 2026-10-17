@@ -59,6 +59,7 @@ import { runBoundTurn, sdkResumeArgs } from './agent/bound-turn.js'
 import type { Attachment, LLMAdapter } from './agent/types.js'
 import { refreshAllFaces, type SendFaceUpdate } from './agent/face-refresh.js'
 import { ClaudeAgentAdapter, isAnthropicImageMime } from './agent/claude/adapter.js'
+import { UnavailableAgentAdapter } from './agent/unavailable/adapter.js'
 import { createHomeDef, wireHomeTools } from './apps/home/index.js'
 import {
   loadApps,
@@ -162,7 +163,24 @@ function toWindowEntry(row: Message): ChatWindowEntryInit {
 // Adapter factory
 // ---------------------------------------------------------------------------
 
-async function createAdapter(config: ServerConfig): Promise<LLMAdapter> {
+/**
+ * Build the configured backend; if it cannot connect (e.g. no credential),
+ * fall back to `UnavailableAgentAdapter` so the server still boots and every
+ * deterministic UI action keeps working without an LLM.
+ */
+export async function createAdapter(config: ServerConfig): Promise<LLMAdapter> {
+  try {
+    return await connectConfiguredAdapter(config)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    console.error(
+      `[agent] backend '${config.backend}' unavailable — starting without an agent: ${reason}`,
+    )
+    return new UnavailableAgentAdapter()
+  }
+}
+
+async function connectConfiguredAdapter(config: ServerConfig): Promise<LLMAdapter> {
   if (config.backend === 'pi') {
     // Dynamic-import so Pi (and its ~400-package transitive tree) only
     // loads when actually selected. Server boot stays cheap on the Claude
