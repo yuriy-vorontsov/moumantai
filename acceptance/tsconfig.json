@@ -1,0 +1,24 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "moumantai": ["../server/src/server/framework/moumantai.ts"],
+      "moumantai/ui": ["../server/src/server/protocol/components/index.ts"],
+      "@moumantai/protocol": ["../shared/protocol/src/index.ts"],
+      "@moumantai/protocol/design-system": [
+        "../shared/protocol/design-system/generated/design-system.ts"
+      ],
+      "@moumantai/protocol/generated/moumantai/v1": [
+        "../shared/protocol/src/generated/moumantai/v1/index.ts"
+      ],
+      "drizzle-orm": ["../server/node_modules/drizzle-orm"],
+      "drizzle-orm/*": ["../server/node_modules/drizzle-orm/*"]
+    }
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules"]
+}

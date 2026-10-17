@@ -55,6 +55,14 @@ tasks:
   apps:typecheck:
     desc: 'TypeScript no-emit check on apps/ submodule (validates plugin apps against codegen SDK Options)'
     cmds: [npx tsc --noEmit -p apps/tsconfig.json]
+  apps:test:
+    desc: 'Vitest app-level tests in the apps/ submodule (apps/<id>/tests/*.test.ts)'
+    cmds: [npx vitest run --config apps/vitest.config.ts]
+  acceptance:test:
+    desc: 'mutabl acceptance suite (spec AT-xx): real server + real apps over the WebSocket protocol'
+    cmds:
+      - npx tsc --noEmit -p acceptance/tsconfig.json
+      - npx vitest run --config acceptance/vitest.config.ts
   format:
     desc: 'Auto-format every language: Prettier/ruff/clang-format (pre-commit) + Kotlin (Spotless via Gradle)'
     env: { PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
