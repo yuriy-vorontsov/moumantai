@@ -125,6 +125,34 @@ describe('invoke-tool flow — happy path', () => {
     expect(summaryUpdate).toBeDefined()
     expect(summaryUpdate?.data).toMatchObject({ $params: { category: 'work' } })
   })
+
+  it('refreshes the face the tap came from even when the server tracks another face as mounted', async () => {
+    await handleInvokeTool(
+      'add_note',
+      { content: 'from summary', category: 'work' },
+      {
+        ...deps(),
+        sourceFaceId: 'notes-summary',
+        getMountedFaceIds: () => new Set(['notes-list']),
+        clientRequestId: '00000000-0000-0000-0000-000000000003',
+      },
+    )
+    expect(faceUpdates.map((u) => u.faceId).sort()).toEqual(['notes-list', 'notes-summary'])
+  })
+
+  it('still skips faces that are neither mounted nor the tap source', async () => {
+    await handleInvokeTool(
+      'add_note',
+      { content: 'from list', category: 'work' },
+      {
+        ...deps(),
+        sourceFaceId: 'notes-list',
+        getMountedFaceIds: () => new Set(['notes-list']),
+        clientRequestId: '00000000-0000-0000-0000-000000000004',
+      },
+    )
+    expect(faceUpdates.map((u) => u.faceId)).toEqual(['notes-list'])
+  })
 })
 
 describe('invoke-tool flow — dedup across retries', () => {

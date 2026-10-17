@@ -112,7 +112,9 @@ export interface HandleInvokeToolDeps {
   /**
    * Returns the set of faceIds currently mounted on at least one client in
    * this app's scope. Used to cap the post-tool refresh to faces actually
-   * being viewed. Optional — when absent, every face is resolved.
+   * being viewed. Optional — when absent, every face is resolved. The
+   * invocation's `sourceFaceId` is always refreshed too: the user just
+   * tapped it, so it is on screen even if the server-tracked mount differs.
    */
   getMountedFaceIds?: () => ReadonlySet<string>
   /** Typed app config. */
@@ -318,6 +320,15 @@ const QUEUE_ERROR_MESSAGE: Record<string, string> = {
   AbortError: 'aborted',
 }
 
+/** Mounted set plus the face the tap came from; `undefined` (refresh all) stays as is. */
+function withSourceFace(
+  mounted: ReadonlySet<string> | undefined,
+  sourceFaceId: string | undefined,
+): ReadonlySet<string> | undefined {
+  if (!mounted || !sourceFaceId || mounted.has(sourceFaceId)) return mounted
+  return new Set([...mounted, sourceFaceId])
+}
+
 function lookupDedup(deps: HandleInvokeToolDeps): InvokeToolOutcome | null {
   if (!deps.dedupStore || !deps.conversationId || !deps.clientRequestId) return null
   const hit = deps.dedupStore.lookup(deps.conversationId, deps.clientRequestId)
@@ -409,7 +420,7 @@ async function executeAndRecord(
       faceStaleness: deps.faceStaleness,
     },
     deps.sendFaceUpdate,
-    deps.getMountedFaceIds?.(),
+    withSourceFace(deps.getMountedFaceIds?.(), deps.sourceFaceId),
   )
 
   return { result, error: null, deduped: false }
