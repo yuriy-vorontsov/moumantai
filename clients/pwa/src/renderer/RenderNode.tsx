@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react'
+import React, { useCallback, useMemo } from 'react'
 import { useAppStore } from './stores/app-store'
 import { resolvePointer } from './data-model'
 import { resolveColor } from './theme'
@@ -311,6 +311,17 @@ export function variantCaseToKind(variantCase: string): string {
   }
 }
 
+const NO_DATA: Record<string, unknown> = {}
+
+/** Face data plus the per-face form scope under `$form` (resolves `/$form/<key>`). */
+function withFormScope(
+  data: Record<string, unknown> | undefined,
+  form: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const base = data ?? NO_DATA
+  return form && Object.keys(form).length > 0 ? { ...base, $form: form } : base
+}
+
 export function RenderNode({
   componentId,
   surfaceId,
@@ -327,9 +338,15 @@ export function RenderNode({
       [appId, faceId, componentId],
     ),
   )
-  const data = useAppStore(
-    useCallback((s) => s.apps.get(appId)?.faces.get(faceId)?.data ?? {}, [appId, faceId]),
-  ) as Record<string, unknown>
+  const faceData = useAppStore(
+    useCallback((s) => s.apps.get(appId)?.faces.get(faceId)?.data, [appId, faceId]),
+  ) as Record<string, unknown> | undefined
+  const form = useAppStore(
+    useCallback((s) => s.apps.get(appId)?.faces.get(faceId)?.form, [appId, faceId]),
+  )
+  // Expose the client-owned form scope at `/$form/...` so inputs bound there
+  // render what the user typed (writes go through setDataAtPath → form).
+  const data = useMemo(() => withFormScope(faceData, form), [faceData, form])
 
   if (!def) return null
 
