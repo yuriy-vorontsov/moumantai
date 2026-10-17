@@ -2,7 +2,7 @@
 """Soft-failing wrapper around `buf breaking`.
 
 Exits non-zero only on genuine breaking changes. The one soft-skip: when
-master has no .proto baseline yet ("had no .proto files"), the first commit
+main has no .proto baseline yet ("had no .proto files"), the first commit
 can't be compared — treated as OK; the next PR becomes the baseline.
 
 Usage:
@@ -26,7 +26,7 @@ def main() -> int:
         str(buf),
         "breaking",
         "--against",
-        "../../../.git#branch=master,subdir=shared/protocol/proto",
+        "../../../.git#branch=main,subdir=shared/protocol/proto",
     ]
     proc = subprocess.run(cmd, cwd=str(PROTO_DIR), capture_output=True, text=True)
     out = (proc.stdout or "") + (proc.stderr or "")
@@ -34,7 +34,7 @@ def main() -> int:
     if proc.returncode == 0:
         return 0
     if "had no .proto files" in out:
-        print("\nnote: master has no .proto baseline yet; treating as ok.")
+        print("\nnote: main has no .proto baseline yet; treating as ok.")
         return 0
     return proc.returncode
 

@@ -28,7 +28,7 @@ tasks:
     dir: '{{.TASKFILE_DIR}}/proto'
     cmds: ['{{.BUF}} lint']
   breaking:
-    desc: 'buf breaking — refuse non-additive .proto changes vs master'
+    desc: 'buf breaking — refuse non-additive .proto changes vs main'
     dir: '{{.ROOT_DIR}}'
     cmds: [uv run python scripts/check-breaking.py]
   format:
