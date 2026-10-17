@@ -256,7 +256,8 @@ describe('changedAppFiles', () => {
   }
 
   it('EDIT: only files that differ from (or are absent in) the live baseline', () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'moumantai-changed-'))
+    // realpath: changedAppFiles returns real paths (macOS tmpdir is a /var → /private/var symlink).
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'moumantai-changed-')))
     tmpDirs.push(base)
     const live = path.join(base, 'live')
     const draft = path.join(base, 'draft')
@@ -280,7 +281,8 @@ describe('changedAppFiles', () => {
   })
 
   it('NEW-APP (liveSrcDir null): every app .ts counts, ephemerals/tests excluded', () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'moumantai-changed-'))
+    // realpath: changedAppFiles returns real paths (macOS tmpdir is a /var → /private/var symlink).
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'moumantai-changed-')))
     tmpDirs.push(base)
     const draft = path.join(base, 'draft')
     mk(draft, 'index.ts', 'A')
