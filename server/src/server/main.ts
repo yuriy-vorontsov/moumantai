@@ -62,6 +62,9 @@ import { refreshAllFaces, type SendFaceUpdate } from './agent/face-refresh.js'
 import { ClaudeAgentAdapter, isAnthropicImageMime } from './agent/claude/adapter.js'
 import { UnavailableAgentAdapter } from './agent/unavailable/adapter.js'
 import { createHomeDef, wireHomeTools } from './apps/home/index.js'
+import { setReleasesView } from './apps/home/faces/releases.js'
+import { buildReleasesView } from './releases/view.js'
+import { restoreRelease } from './releases/restore.js'
 import {
   loadApps,
   reloadSingleApp,
@@ -1202,7 +1205,48 @@ export async function createAppServer(
     setDeviceFocus: (deviceId: string, appId: string) => {
       transport.setDeviceFocus?.(deviceId, appId)
     },
+    // Release History → Restore. UI-only tool; owners only (spec §8: restoring
+    // a release is a privileged action, like approving a publish).
+    restoreRelease: async (releaseId: string, originDeviceId: string | undefined) => {
+      const isOwner =
+        !config.pairingRequired ||
+        (originDeviceId !== undefined && store.isDeviceOwner(originDeviceId))
+      if (!isOwner) return { ok: false as const, error: 'Only the owner can restore a release.' }
+      const target = releaseStore.get(releaseId)
+      if (!target) return { ok: false as const, error: 'That release no longer exists.' }
+      const outcome = await restoreRelease(
+        {
+          home,
+          store: releaseStore,
+          liveDbPath: (id) => appPaths(home, id).dbFile,
+          activate: (id) => activateApp(id, 'edit'),
+          principal: originDeviceId ?? 'local',
+        },
+        target.appId,
+        releaseId,
+      )
+      if (!outcome.ok) return { ok: false as const, error: outcome.error }
+      // Every device switches to the restored release's faces right away.
+      const clients = wsServer.getLiveConnections()
+      broadcastAppList(wsServer, appEngine, clients, draftRegistry)
+      broadcastFaces(wsServer, appEngine, target.appId, clients, undefined, draftRegistry)
+      return {
+        ok: true as const,
+        message: `${target.appId} ${outcome.release.version} is active again.`,
+      }
+    },
   }
+  setReleasesView(() =>
+    buildReleasesView({
+      store: releaseStore,
+      apps: () =>
+        appEngine
+          .listApps()
+          .filter((m) => m.id !== 'home')
+          .map((m) => ({ id: m.id, name: m.name, version: m.version })),
+      liveDbPath: (id) => appPaths(home, id).dbFile,
+    }),
+  )
 
   // 9a. setContext factory: writes context.json atomically and reloads
   // BootedApp.context in-place so subsequent turns see the new value.

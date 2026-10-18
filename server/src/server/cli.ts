@@ -23,13 +23,15 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createInterface } from 'node:readline/promises'
 import { stdin, stdout, stderr, exit, env, platform } from 'node:process'
 import {
   resolveMoumantaiHome,
   resolveMoumantaiHomeWithSource,
   ensureHomeLayout,
+  appPaths,
+  draftPaths,
   homeLayout,
   defaultPointerPath,
   writeHomePointer,
@@ -66,6 +68,11 @@ import {
 import type { Device } from './conversations/schema.js'
 import { DeviceClass } from '@moumantai/protocol/generated/moumantai/v1'
 import { getNativeClient } from './db/maintenance.js'
+import { ReleaseStore } from './releases/store.js'
+import { restoreRelease } from './releases/restore.js'
+import { fileChanges } from './releases/pipeline.js'
+import { pointerPath } from './releases/publish.js'
+import type { DraftMeta } from './drafts/types.js'
 
 // ---------------------------------------------------------------------------
 // Top-level dispatch
@@ -106,6 +113,12 @@ export async function runCli(argv: string[]): Promise<number> {
 
       case 'change':
         return cmdChange(sub, rest)
+
+      case 'release':
+        return await cmdRelease(sub, rest)
+
+      case 'draft':
+        return cmdDraft(sub, rest)
 
       default:
         stderr.write(`Unknown command: ${cmd}\n\n`)
@@ -159,6 +172,11 @@ Commands:
   device prune [--older-than <Nd>] [--unpaired] [--all] [--yes]  Bulk-delete stale/junk device rows.
   change list [--all]           List change requests raised in User Mode (open + in progress; --all includes closed).
   change reject <number>        Close a change request without building it.
+  draft list                    List open drafts (Developer Mode).
+  draft diff <draft> [--patch]  Files a draft changes vs the active release (--patch: unified diff).
+  release list [<app>]          List published releases (active first per app, newest first).
+  release restore <app> <version|id>  Reactivate an earlier release (pointer switch; takes effect on server restart —
+                                  use the Releases face in the app for a live restore).
 
 Environment:
   MOUMANTAI_HOME               Override the workspace location (default: ~/.moumantai/).
@@ -648,6 +666,166 @@ function cmdChange(sub: string | undefined, args: string[]): number {
       }
       default:
         stderr.write(`Unknown change subcommand: ${sub}\nTry: list [--all] | reject <number>\n`)
+        return 2
+    }
+  } finally {
+    try {
+      getNativeClient(platformDb)?.close?.()
+    } catch {
+      /* non-fatal */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// draft — inspect Developer Mode drafts (read-only)
+// ---------------------------------------------------------------------------
+
+function readDrafts(home: string): DraftMeta[] {
+  const dir = path.join(home, 'apps-drafts')
+  if (!fs.existsSync(dir)) return []
+  return fs
+    .readdirSync(dir)
+    .map((id) => draftPaths(home, id).metaFile)
+    .filter((f) => fs.existsSync(f))
+    .map((f) => JSON.parse(fs.readFileSync(f, 'utf8')) as DraftMeta)
+    .sort((a, b) => b.createdAt - a.createdAt)
+}
+
+function cmdDraft(sub: string | undefined, args: string[]): number {
+  const home = resolveMoumantaiHome()
+  const drafts = readDrafts(home)
+  switch (sub) {
+    case 'list':
+    case undefined: {
+      if (drafts.length === 0) {
+        stdout.write('No open drafts.\n')
+        return 0
+      }
+      printTable(
+        ['DRAFT', 'APP', 'KIND', 'READY', 'CREATED', 'SUMMARY'],
+        drafts.map((d) => [
+          d.draftId.slice(0, 8),
+          d.appId,
+          d.kind,
+          d.readyForReview ? 'yes' : 'no',
+          relTime(new Date(d.createdAt).toISOString()),
+          (d.summary ?? '').slice(0, 60),
+        ]),
+      )
+      return 0
+    }
+    case 'diff': {
+      const [ref] = args
+      const matches = ref ? drafts.filter((d) => d.draftId.startsWith(ref) || d.appId === ref) : []
+      if (matches.length !== 1) {
+        stderr.write(
+          ref && matches.length > 1
+            ? `"${ref}" matches ${matches.length} drafts; use a longer draft id.\n`
+            : 'Usage: task server:cli -- draft diff <draft-id|app> [--patch]\n',
+        )
+        return 2
+      }
+      const d = matches[0]!
+      const draftDir = draftPaths(home, d.draftId).dir
+      const pointer = pointerPath(home, d.appId)
+      const activeDir =
+        d.kind === 'edit' && fs.existsSync(pointer) ? fs.realpathSync(pointer) : null
+      const changes = fileChanges(draftDir, activeDir)
+      stdout.write(
+        `Draft ${d.draftId.slice(0, 8)} (${d.kind} ${d.appId}) vs ${activeDir ?? 'nothing (new app)'}\n`,
+      )
+      if (changes.length === 0) {
+        stdout.write('No changes.\n')
+        return 0
+      }
+      for (const c of changes)
+        stdout.write(`  ${c.status.padEnd(8)} ${c.path}  +${c.added} -${c.removed}\n`)
+      if (args.includes('--patch')) {
+        for (const c of changes) {
+          const before =
+            c.status === 'added' || !activeDir ? '/dev/null' : path.join(activeDir, c.path)
+          const after = c.status === 'removed' ? '/dev/null' : path.join(draftDir, c.path)
+          const r = spawnSync(
+            'diff',
+            ['-u', '--label', `a/${c.path}`, '--label', `b/${c.path}`, before, after],
+            {
+              encoding: 'utf8',
+            },
+          )
+          stdout.write(r.stdout)
+        }
+      }
+      return 0
+    }
+    default:
+      stderr.write(`Unknown draft subcommand: ${sub}\nTry: list | diff <draft-id|app> [--patch]\n`)
+      return 2
+  }
+}
+
+// ---------------------------------------------------------------------------
+// release — immutable releases (mutabl spec §7.5–7.6)
+// ---------------------------------------------------------------------------
+
+async function cmdRelease(sub: string | undefined, args: string[]): Promise<number> {
+  const home = resolveMoumantaiHome()
+  ensureHomeLayout(home)
+  const platformDb = openPlatformDb(home)
+  const releases = new ReleaseStore(platformDb)
+  try {
+    switch (sub) {
+      case 'list':
+      case undefined: {
+        const rows = releases.list(args[0])
+        if (rows.length === 0) {
+          stdout.write('No releases.\n')
+          return 0
+        }
+        printTable(
+          ['APP', 'VERSION', 'STATUS', 'SOURCE', 'ID', 'HASH', 'CREATED'],
+          rows.map((r) => [
+            r.appId,
+            r.version,
+            r.status,
+            r.source,
+            r.id.slice(0, 8),
+            r.contentHash.slice(0, 12),
+            relTime(r.createdAt),
+          ]),
+        )
+        return 0
+      }
+      case 'restore': {
+        const [appId, target] = args
+        if (!appId || !target) {
+          stderr.write('Usage: task server:cli -- release restore <app> <version|id>\n')
+          return 2
+        }
+        const match = releases.list(appId).find((r) => r.id.startsWith(target))
+        const out = await restoreRelease(
+          {
+            home,
+            store: releases,
+            liveDbPath: (id) => appPaths(home, id).dbFile,
+            principal: 'cli',
+          },
+          appId,
+          match?.id ?? target,
+        )
+        if (!out.ok) {
+          stderr.write(`${out.error}\n`)
+          return 1
+        }
+        stdout.write(
+          `${appId} ${out.release.version} is the active release. Restart the server to load it (the Releases face restores live).\n`,
+        )
+        return 0
+      }
+      default:
+        stderr.write(
+          `Unknown release subcommand: ${sub}\nTry: list [<app>] | restore <app> <version|id>\n`,
+        )
         return 2
     }
   } finally {

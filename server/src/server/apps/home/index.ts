@@ -9,7 +9,9 @@ import type { AppDefinition, ToolDefinition } from '../../agent/types.js'
 import talkToApp from './tools/talk-to-app.js'
 import listApps from './tools/list-apps.js'
 import navigateApp from './tools/navigate-app.js'
+import restoreRelease from './tools/restore-release.js'
 import mainFace from './faces/main.js'
+import releasesFace from './faces/releases.js'
 
 export function createHomeDef(): AppDefinition {
   return {
@@ -20,8 +22,8 @@ export function createHomeDef(): AppDefinition {
       icon: 'chat',
       description: 'Your personal assistant',
     },
-    tools: [talkToApp, listApps, navigateApp],
-    faces: [mainFace],
+    tools: [talkToApp, listApps, navigateApp, restoreRelease],
+    faces: [mainFace, releasesFace],
     skill:
       'You are the home assistant. Route domain-specific requests to the appropriate app using talk_to_app. For general questions, respond directly.',
   }
@@ -44,6 +46,14 @@ export function wireHomeTools(
      * own view. No-op when deviceId is undefined (server-internal turns).
      */
     setDeviceFocus: (deviceId: string, appId: string) => void
+    /**
+     * Owner-gated release restore for the Release History face. Returns the
+     * user-facing outcome; the caller refreshes faces.
+     */
+    restoreRelease: (
+      releaseId: string,
+      originDeviceId: string | undefined,
+    ) => Promise<{ ok: true; message: string } | { ok: false; error: string }>
   },
 ): void {
   // Replace tools in the registry with wired versions (originals are frozen)
@@ -63,6 +73,19 @@ export function wireHomeTools(
     toolRegistry.set('list_apps', {
       ...listTool,
       execute: async () => ({ result: deps.getAppList() }),
+    })
+  }
+
+  const restoreTool = toolRegistry.get('restore_release')
+  if (restoreTool) {
+    toolRegistry.set('restore_release', {
+      ...restoreTool,
+      execute: async ({ params, originDeviceId }) => {
+        const r = await deps.restoreRelease(params.release_id as string, originDeviceId)
+        return r.ok
+          ? { result: { restored: true, message: r.message } }
+          : { result: null, error: r.error }
+      },
     })
   }
 
