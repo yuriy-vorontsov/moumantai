@@ -125,7 +125,7 @@ import {
   msgDraftActionResult,
   msgChatTodosUpdate,
 } from './transport/messages.js'
-import { DraftRegistry } from './drafts/draft-registry.js'
+import { DraftRegistry, type DraftEntry } from './drafts/draft-registry.js'
 import { DraftStore } from './drafts/draft-store.js'
 import { promotions } from './drafts/promotions-schema.js'
 import { buildEditAgentRequest } from './agent/edit-session.js'
@@ -396,11 +396,24 @@ export async function createAppServer(
   }
 
   // 6. Face update broadcaster. Scope-gated; backpressure-paused sockets skip.
+  // Preview isolation (mutabl spec §7.4): a session previewing a draft of an
+  // app sees and acts on the draft (its tools, its shadow DB) — never live.
+  const previewedDraftOf = (
+    c: { previewingDraft?: ReadonlySet<string> } | undefined,
+    appId: string,
+  ): DraftEntry | undefined =>
+    c?.previewingDraft?.size
+      ? draftRegistry
+          ?.listActiveDrafts()
+          .find((d) => d.appId === appId && d.booted && c.previewingDraft!.has(d.draftId))
+      : undefined
+
   const sendFaceUpdate: SendFaceUpdate = (appId, faceId, registry, data) => {
     const scope = appId === 'home' ? 'home' : `app:${appId}`
     for (const c of wsServer.getLiveConnections()) {
       if (wsServer.getActiveScope(c.sessionId) !== scope) continue
       if (wsServer.isBackpressurePaused(c.sessionId)) continue
+      if (previewedDraftOf(c, appId)) continue // shows the draft, not live
       const selected = registry.selectForSize(faceId, c.sizeClass)
       const components = filterComponentsForDevice(selected.components, c.deviceClass)
       wsServer.send(
@@ -2255,6 +2268,62 @@ export async function createAppServer(
     await dispatchVoiceEvents(sessionId, scope, events)
   })
 
+  /**
+   * A tap inside a previewed draft: run the draft's tool against its shadow
+   * DB and refresh only the sessions previewing that draft. No dedup store,
+   * transcript or chat escalation — those belong to the live conversation.
+   */
+  const invokeInDraft = async (
+    sessionId: string,
+    draft: DraftEntry,
+    msg: { toolName: string; args?: unknown; sourceFaceId: string; clientRequestId: string },
+  ): Promise<void> => {
+    const app = draft.booted
+    const scope = appIdToScope(draft.appId)
+    const sendDraftFaceUpdate: SendFaceUpdate = (appId, faceId, registry, data) => {
+      for (const c of wsServer.getLiveConnections()) {
+        if (!c.previewingDraft?.has(draft.draftId)) continue
+        if (wsServer.getActiveScope(c.sessionId) !== scope) continue
+        const selected = registry.selectForSize(faceId, c.sizeClass)
+        const components = filterComponentsForDevice(selected.components, c.deviceClass)
+        wsServer.send(
+          c.sessionId,
+          msgFaceUpdate({ scope, appId, faceId, components, data, variant: AppVariant.DRAFT }),
+        )
+      }
+    }
+    const originDeviceId = wsServer.getDeviceId(sessionId)
+    const outcome = await handleInvokeTool(
+      msg.toolName,
+      (msg.args ?? {}) as Record<string, unknown>,
+      {
+        toolRegistry: app.toolRegistry,
+        faceRegistry: app.faceRegistry,
+        db: app.db,
+        appId: draft.appId,
+        sendFaceUpdate: sendDraftFaceUpdate,
+        faceParamsStore,
+        context: app.context,
+        config: app.config,
+        backend: config.backend,
+        ...(originDeviceId ? { originDeviceId } : {}),
+        // Draft view-state is keyed by draftId (see pushAppFaces).
+        conversationId: draft.draftId,
+        sourceFaceId: msg.sourceFaceId,
+        clientRequestId: msg.clientRequestId,
+      },
+    )
+    if (outcome.error) {
+      wsServer.send(
+        sessionId,
+        msgError({
+          code: ProtocolErrorCode.UNSPECIFIED,
+          message: `[${outcome.error.code}] ${outcome.error.message}`,
+        }),
+      )
+    }
+  }
+
   wsServer.onInvokeTool(async (sessionId, msg) => {
     if (!msg.toolName) return
 
@@ -2263,6 +2332,15 @@ export async function createAppServer(
     // the message itself doesn't carry enough info, then to home.
     const sessionScope = wsServer.getActiveScope(sessionId) ?? 'home'
     const appId = scopeToAppId(sessionScope) ?? 'home'
+
+    const previewed = previewedDraftOf(
+      wsServer.getLiveConnections().find((c) => c.sessionId === sessionId),
+      appId,
+    )
+    if (previewed) {
+      await invokeInDraft(sessionId, previewed, msg)
+      return
+    }
 
     // Swallow boot errors — an invocation whose target app won't boot is a
     // silent no-op rather than a fatal (no user is waiting on a turn here).
