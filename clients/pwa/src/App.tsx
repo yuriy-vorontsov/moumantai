@@ -56,6 +56,14 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(readTheme)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [releasesOpen, setReleasesOpen] = useState(false)
+  const [jobsOpen, setJobsOpen] = useState(false)
+  const hasJobsFace = useAppStore((s) => s.apps.get('home')?.faceOrder.includes('jobs') ?? false)
+  const pendingApprovals = useAppStore((s) => {
+    const summary = s.apps.get('home')?.faces.get('jobs')?.data?.summary as
+      | { pending_approvals?: number }
+      | undefined
+    return summary?.pending_approvals ?? 0
+  })
   const [transportEpoch, setTransportEpoch] = useState(0)
   const [devModeEnabled, setDevModeEnabled] = useState(false)
   const transportRef = useRef<WebSocketTransport | null>(null)
@@ -132,11 +140,28 @@ export default function App() {
 
     // Chat callbacks
     ws.onChatMessage((msg) => {
-      if (msg.role === ChatRole.SYSTEM) return
       const key = scopeToChatKey(msg.scope)
       const kind = msg.kind === ChatKind.DEV ? 'dev' : 'chat'
       const store = useChatStore.getState()
       const role = roleLabel(msg.role)
+
+      // Server notes (e.g. "Waiting for your approval…") arrive mid-turn: show
+      // them live, as the reconnect snapshot does, but keep the turn's pending
+      // indicator — only the assistant reply clears it.
+      if (msg.role === ChatRole.SYSTEM) {
+        store.addMessage(
+          key,
+          {
+            id: msg.id || crypto.randomUUID(),
+            role: 'system',
+            text: msg.text,
+            timestamp: msg.timestamp || new Date().toISOString(),
+            status: 'sent',
+          },
+          kind,
+        )
+        return
+      }
 
       // Reconcile optimistic user row by echoed clientMsgId. Returning early
       // preserves the "thinking" indicator — only the assistant reply clears it.
@@ -172,8 +197,9 @@ export default function App() {
       const store = useChatStore.getState()
       store.setConversationId(msg.scope, msg.conversationId, kind)
       store.clearMessages(key, kind)
+      // System rows (approval notes, outcomes) are part of the thread, live and
+      // in the snapshot alike.
       for (const e of msg.entries) {
-        if (e.role === ChatRole.SYSTEM) continue
         store.addMessage(
           key,
           {
@@ -348,6 +374,8 @@ export default function App() {
         onThemeToggle={toggleTheme}
         themeMode={theme}
         onSettingsOpen={() => setSettingsOpen(true)}
+        onJobsOpen={hasJobsFace ? () => setJobsOpen(true) : undefined}
+        jobsBadge={pendingApprovals}
         onReleasesOpen={
           activeAppId === 'home' && apps.get('home')?.faceOrder.includes('releases')
             ? () => setReleasesOpen(true)
@@ -432,6 +460,10 @@ export default function App() {
         </AppShell>
       )}
       {/* Home renders as full-screen chat, so its Release History face lives in a sheet. */}
+      {/* Agent Jobs: approvals, running/recent jobs, event log — over any app. */}
+      <Sheet open={jobsOpen} onDismiss={() => setJobsOpen(false)}>
+        <RenderNode componentId="root" surfaceId="home:jobs" dispatch={dispatch} />
+      </Sheet>
       <Sheet open={releasesOpen} onDismiss={() => setReleasesOpen(false)}>
         <RenderNode componentId="root" surfaceId="home:releases" dispatch={dispatch} />
       </Sheet>

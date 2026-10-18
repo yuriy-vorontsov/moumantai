@@ -10,6 +10,9 @@ export interface StatusHeaderProps {
   onSettingsOpen: () => void
   /** Shown on Home when the server offers the Release History face. */
   onReleasesOpen?: () => void
+  /** Agent Jobs sheet (every screen); `jobsBadge` = approvals waiting. */
+  onJobsOpen?: () => void
+  jobsBadge?: number
 }
 
 /**
@@ -21,6 +24,7 @@ export interface StatusHeaderProps {
  *     THINKING = breathe; SPEAKING = waveform-like quick pulse.
  *   - connection indicator (signal icon)
  *   - theme toggle
+ *   - agent jobs, with a badge for approvals waiting (every screen)
  *   - release history (Home only, when available)
  *   - settings
  *
@@ -33,6 +37,8 @@ export function StatusHeader({
   themeMode,
   onSettingsOpen,
   onReleasesOpen,
+  onJobsOpen,
+  jobsBadge = 0,
 }: StatusHeaderProps) {
   const status = useConnectionStore((s) => s.status)
   const voiceState = useChatStore((s) => s.voiceState)
@@ -45,6 +51,23 @@ export function StatusHeader({
         <IconButton onClick={onThemeToggle} aria-label="Toggle theme">
           {themeMode === 'dark' ? 'light_mode' : 'dark_mode'}
         </IconButton>
+        {onJobsOpen && (
+          <span className={styles.badgeHost}>
+            <IconButton
+              onClick={onJobsOpen}
+              aria-label={
+                jobsBadge > 0 ? `Agent Jobs, ${jobsBadge} waiting for approval` : 'Agent Jobs'
+              }
+            >
+              pending_actions
+            </IconButton>
+            {jobsBadge > 0 && (
+              <span className={styles.badge} aria-hidden>
+                {jobsBadge}
+              </span>
+            )}
+          </span>
+        )}
         {onReleasesOpen && (
           <IconButton onClick={onReleasesOpen} aria-label="Releases">
             history

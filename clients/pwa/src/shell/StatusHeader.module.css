@@ -179,3 +179,24 @@
     animation: none;
   }
 }
+
+/* M3 small badge on the Agent Jobs button: approvals waiting. */
+.badgeHost {
+  position: relative;
+  display: inline-flex;
+}
+.badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--moumantai-shape-full);
+  background: var(--md-sys-color-error);
+  color: var(--md-sys-color-on-error);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  pointer-events: none;
+}

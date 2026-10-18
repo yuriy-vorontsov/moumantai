@@ -262,6 +262,8 @@ export const useAppStore = create<AppStoreState>((set, get) => ({
       let changed = false
       state.appOrder.forEach((appId, i) => {
         if (Math.abs(i - activeIndex) <= window) return
+        // Home's faces back global sheets (Agent Jobs, Releases) shown over any app.
+        if (appId === 'home') return
         const app = nextApps.get(appId)
         if (!app || app.faces.size === 0) return
         let appChanged = false
