@@ -80,6 +80,12 @@ import {
 } from './agent/broadcast.js'
 import { wireSynthFaceTools } from './agent/synthesize-face-tool.js'
 import { synthesizeUpdateContextTool } from './agent/synthesize-update-context-tool.js'
+import {
+  REQUEST_CHANGE_TOOL,
+  synthesizeChangeRequestTool,
+} from './agent/synthesize-change-request-tool.js'
+import { ChangeRequestStore } from './change-requests/store.js'
+import type { ChangeRequest } from './change-requests/schema.js'
 import { createHttpClient } from './framework/http-client.js'
 import { createAssetCache, tryServeAssetRequest } from './framework/asset-cache.js'
 import { vacuumIfIdle } from './db/maintenance.js'
@@ -162,6 +168,10 @@ function toWindowEntry(row: Message): ChatWindowEntryInit {
 // ---------------------------------------------------------------------------
 // Adapter factory
 // ---------------------------------------------------------------------------
+
+/** Reply to any Developer Mode action from a non-owner session. */
+const DEV_MODE_OWNER_ONLY =
+  "Developer Mode is available only on the owner's device (task server:cli -- device role <code> owner)."
 
 /**
  * Build the configured backend; if it cannot connect (e.g. no credential),
@@ -270,6 +280,7 @@ export async function createAppServer(
   fs.mkdirSync(homeLayout(home).homeAppCwd, { recursive: true })
   const platformDb = openPlatformDb(home)
   const store = new ConversationStore(platformDb)
+  const changeRequestStore = new ChangeRequestStore(platformDb)
   const faceParamsStore = new FaceParamsStore(platformDb)
   const dedupStore = new DedupStore(platformDb)
   // Background sweep for stale dedup rows; cleared at server close.
@@ -285,6 +296,36 @@ export async function createAppServer(
   // 1. Transport
   const wsServer = new WsServer({ devModeEnabled: config.devModeEnabled })
   const turnQueue = new TurnQueue()
+
+  // Change requests (User Mode → Developer Mode handoff, spec §8.1). Owners see
+  // each open request as a DEV-thread notice for its app; the stable message id
+  // lets clients drop re-sends.
+  const changeRequestNotice = (cr: ChangeRequest) =>
+    msgChat({
+      id: `change-request-${cr.id}`,
+      scope: appIdToScope(cr.appId),
+      conversationId: '',
+      role: 'assistant',
+      text:
+        `Change request #${cr.number} from User Mode: "${cr.request}". ` +
+        'Send a message here to start a draft; open requests are included automatically.',
+      timestamp: cr.createdAt,
+      kind: 'dev',
+    })
+  const notifyOwnersOfChangeRequest = (cr: ChangeRequest): void => {
+    if (!config.devModeEnabled) return
+    for (const c of wsServer.getLiveConnections()) {
+      if (c.isOwner && c.deviceClass === DeviceClass.PHONE) {
+        wsServer.send(c.sessionId, changeRequestNotice(cr))
+      }
+    }
+  }
+  const sendOpenChangeRequests = (sessionId: string, appId: string): void => {
+    if (!config.devModeEnabled || !wsServer.isOwner(sessionId)) return
+    for (const cr of changeRequestStore.listActive(appId)) {
+      if (cr.status === 'open') wsServer.send(sessionId, changeRequestNotice(cr))
+    }
+  }
 
   // 2. HTTP server. Asset route takes precedence over the health JSON.
   // Health body is cached and refreshed only when the app set changes.
@@ -432,7 +473,7 @@ export async function createAppServer(
         errorMessage,
       })
       for (const c of wsServer.getLiveConnections()) {
-        if (c.deviceClass === DeviceClass.PHONE) wsServer.send(c.sessionId, msg)
+        if (c.deviceClass === DeviceClass.PHONE && c.isOwner) wsServer.send(c.sessionId, msg)
       }
     }
 
@@ -573,11 +614,14 @@ export async function createAppServer(
         `[dev-turn] start draft=${draftId} conv=${conversationId.slice(0, 8)} kind=${kind} chars=${msg.text.length}`,
       )
 
+      // Open change requests for this app ride along with the draft (spec §8.1).
+      const changeRequests = changeRequestStore.linkToDraft(liveAppId ?? 'home', draftId)
       const editReq = buildEditAgentRequest({
         draftId,
         conversationId,
         message: msg.text,
         kind,
+        changeRequests: changeRequests.map((cr) => ({ number: cr.number, request: cr.request })),
         draftDir: dp.dir,
         appsSrcDir: homeLayout(home).appsSrcDir,
         shadowDbPath: dp.shadowDbFile,
@@ -689,7 +733,19 @@ export async function createAppServer(
     }
 
     // ---- Draft action handlers (each ACKs via DraftActionResult) ----
+    // Every draft action is owner-only, enforced here regardless of the UI.
+    const rejectNonOwner = (sessionId: string, draftId: string): boolean => {
+      if (wsServer.isOwner(sessionId)) return false
+      console.warn(`[dev] DENY non-owner draft action session=${sessionId} draft=${draftId}`)
+      wsServer.send(
+        sessionId,
+        msgDraftActionResult({ draftId, ok: false, error: DEV_MODE_OWNER_ONLY }),
+      )
+      return true
+    }
+
     wsServer.onPreviewOptIn((sessionId, m) => {
+      if (rejectNonOwner(sessionId, m.draftId)) return
       const ok = wsServer.setPreviewingDraft(sessionId, m.draftId, m.optIn)
       wsServer.send(sessionId, msgDraftActionResult({ draftId: m.draftId, ok }))
       if (ok) {
@@ -701,6 +757,7 @@ export async function createAppServer(
     })
 
     wsServer.onDraftReload(async (sessionId, m) => {
+      if (rejectNonOwner(sessionId, m.draftId)) return
       const res = await drafts.reloadDraft(m.draftId)
       wsServer.send(
         sessionId,
@@ -721,6 +778,7 @@ export async function createAppServer(
     })
 
     wsServer.onDraftPromote(async (sessionId, m) => {
+      if (rejectNonOwner(sessionId, m.draftId)) return
       const meta = drafts.getDraft(m.draftId)
       const res = await drafts.promoteDraft(m.draftId)
       wsServer.send(
@@ -731,6 +789,7 @@ export async function createAppServer(
           error: res.ok ? undefined : res.error,
         }),
       )
+      if (res.ok) changeRequestStore.completeDraft(m.draftId)
       if (!meta) return
       if (res.ok) {
         broadcastDraftState(meta, DraftStatus.PROMOTED)
@@ -741,9 +800,11 @@ export async function createAppServer(
     })
 
     wsServer.onDraftDiscard((sessionId, m) => {
+      if (rejectNonOwner(sessionId, m.draftId)) return
       const meta = drafts.getDraft(m.draftId)
       devInflight.get(m.draftId)?.abort()
       const res = drafts.discardDraft(m.draftId)
+      if (res.ok) changeRequestStore.releaseDraft(m.draftId)
       wsServer.send(
         sessionId,
         msgDraftActionResult({
@@ -759,6 +820,7 @@ export async function createAppServer(
     })
 
     wsServer.onDraftTurnCancel((sessionId, m) => {
+      if (rejectNonOwner(sessionId, m.draftId)) return
       devInflight.get(m.draftId)?.abort()
       wsServer.send(sessionId, msgDraftActionResult({ draftId: m.draftId, ok: true }))
     })
@@ -766,8 +828,9 @@ export async function createAppServer(
     // Reset the dev conversation (archive + fresh row) while keeping the
     // draft/worktree. A new-app draft's dev scope is 'home', so kind (not
     // scope) is the discriminator. The chat reset handler skips kind=DEV.
-    wsServer.onResetConversation((_sessionId, msg) => {
+    wsServer.onResetConversation((sessionId, msg) => {
       if (msg.kind !== ChatKind.DEV) return
+      if (!wsServer.isOwner(sessionId)) return
       const scope = msg.scope || 'home'
       const meta =
         scope === 'home'
@@ -791,7 +854,7 @@ export async function createAppServer(
     // On (re)connect, replay existing drafts to PHONE clients so they rebuild
     // their drafts map and re-opt-in to preview.
     wsServer.onConnect((sessionId, _deviceId, deviceClass) => {
-      if (deviceClass !== DeviceClass.PHONE) return
+      if (deviceClass !== DeviceClass.PHONE || !wsServer.isOwner(sessionId)) return
       for (const meta of drafts.listActiveDrafts()) {
         wsServer.send(
           sessionId,
@@ -1021,6 +1084,20 @@ export async function createAppServer(
     }
   }
 
+  // Synthesize `request_app_change` (User Mode → Developer Mode handoff) on
+  // every app. Idempotent — replaces any prior instance after a reload.
+  function wireChangeRequestTool(appId: string): void {
+    appEngine.removeTool(appId, REQUEST_CHANGE_TOOL)
+    appEngine.addTool(
+      appId,
+      synthesizeChangeRequestTool({
+        appId,
+        store: changeRequestStore,
+        onCreated: notifyOwnersOfChangeRequest,
+      }),
+    )
+  }
+
   // 9. Helper: supplemental scan + re-wire after boot/reboot
   async function rewireApp(appId: string, appDir: string): Promise<void> {
     const app = appEngine.getApp(appId)!
@@ -1044,6 +1121,7 @@ export async function createAppServer(
     // and runs sweepStaleVersions to clean stale `face_params` rows from past
     // schema versions.
     wireSynthFaceTools({ appId, appEngine, faceParamsStore, transport })
+    wireChangeRequestTool(appId)
   }
 
   // 10. File watcher for hot-reload
@@ -1144,6 +1222,7 @@ export async function createAppServer(
       wireHomeTools(app.toolRegistry, homeToolDeps)
       // Synth view tools (no-op for home today; keeps wiring symmetric).
       wireSynthFaceTools({ appId: 'home', appEngine, faceParamsStore, transport })
+      wireChangeRequestTool('home')
     }
 
     // Register refresh tasks. swapApp re-fires this hook; unregisterApp
@@ -1494,6 +1573,11 @@ export async function createAppServer(
     },
   )
 
+  // Owner gate: Developer Mode (dev chat, preview, promote, discard) is for
+  // owner devices only. Pairing off = trusted local single-user setup, where
+  // every session is the owner.
+  wsServer.setOwnerResolver((deviceId) => !config.pairingRequired || store.isDeviceOwner(deviceId))
+
   wsServer.onConnect(async (sessionId, deviceId, deviceClass, deviceProfile, nav) => {
     store.upsertDevice({
       deviceId,
@@ -1536,6 +1620,7 @@ export async function createAppServer(
     )
 
     const appId = scopeToAppId(msg.scope) ?? 'home'
+    sendOpenChangeRequests(sessionId, appId)
 
     // Server-SSOT: persist the user's swipe to the devices row so the
     // next reconnect bootstraps from this scope.
@@ -1807,6 +1892,22 @@ export async function createAppServer(
             conversationId: '',
             role: 'assistant',
             text: 'Developer mode is not enabled on the server. Set MOUMANTAI_DEV_MODE=1 (or devMode in config.json) and restart the server.',
+            timestamp: new Date().toISOString(),
+            kind: 'dev',
+          }),
+        )
+        return
+      }
+      if (!wsServer.isOwner(sessionId)) {
+        console.warn(`[dev-turn] DENY non-owner dev message session=${sessionId}`)
+        wsServer.send(
+          sessionId,
+          msgChat({
+            id: `dev-err-${Date.now()}`,
+            scope: msg.scope ?? 'home',
+            conversationId: '',
+            role: 'assistant',
+            text: DEV_MODE_OWNER_ONLY,
             timestamp: new Date().toISOString(),
             kind: 'dev',
           }),

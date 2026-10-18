@@ -630,6 +630,25 @@ export class ConversationStore extends TypedEmitter<ConversationEvents> {
     return true
   }
 
+  /**
+   * True only for a paired device whose role is 'owner'. Unknown, pending or
+   * 'user' devices → false. (Callers treat pairing-off as owner themselves.)
+   */
+  isDeviceOwner(deviceId: string): boolean {
+    const row = this.db
+      .select({ paired: devices.paired, role: devices.role })
+      .from(devices)
+      .where(eq(devices.deviceId, deviceId))
+      .get()
+    return !!row?.paired && row.role === 'owner'
+  }
+
+  /** Set a device's principal role. False if the device is unknown. */
+  setDeviceRole(deviceId: string, role: 'owner' | 'user'): boolean {
+    const r = this.db.update(devices).set({ role }).where(eq(devices.deviceId, deviceId)).run()
+    return (r.changes ?? 0) > 0
+  }
+
   /** Set the display label (works in any pairing state). False if not found. */
   renameDevice(deviceId: string, label: string): boolean {
     const r = this.db

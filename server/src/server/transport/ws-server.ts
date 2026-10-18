@@ -120,6 +120,13 @@ interface SessionState {
    * broadcast layer to route the draft variant to this session only.
    */
   previewingDraft: Set<string>
+
+  /**
+   * Principal role, evaluated once at handshake by the owner resolver. Owner
+   * sessions may use Developer Mode (dev chat, preview, promote, discard);
+   * role changes apply on the device's next reconnect.
+   */
+  isOwner: boolean
 }
 
 // Callback types
@@ -210,6 +217,8 @@ export class WsServer implements ServerTransport {
   private disconnectHandlers: DisconnectHandler[] = []
   // Pairing gate; default always-allow keeps pairing opt-in / tests untouched.
   private pairingResolver: PairingResolver = () => true
+  // Owner gate; default every session is owner (single local owner).
+  private ownerResolver: (deviceId: string) => boolean = () => true
   private chatInputHandlers: ChatInputHandler[] = []
   private audioInputHandlers: AudioInputHandler[] = []
   private ttsRequestHandlers: TTSRequestHandler[] = []
@@ -305,6 +314,16 @@ export class WsServer implements ServerTransport {
     this.pairingResolver = resolver
   }
 
+  /** Inject the owner gate (deviceId → may use Developer Mode). Replaces any prior. */
+  setOwnerResolver(resolver: (deviceId: string) => boolean): void {
+    this.ownerResolver = resolver
+  }
+
+  /** True when the session belongs to an owner device. Unknown session → false. */
+  isOwner(sessionId: string): boolean {
+    return this.sessions.get(sessionId)?.isOwner ?? false
+  }
+
   onDisconnect(handler: DisconnectHandler): void {
     this.disconnectHandlers.push(handler)
   }
@@ -373,6 +392,7 @@ export class WsServer implements ServerTransport {
     voiceState: VoiceStateValue
     voiceTurnId?: string
     previewingDraft: ReadonlySet<string>
+    isOwner: boolean
   }> {
     const out = []
     for (const s of this.sessions.values()) {
@@ -386,6 +406,7 @@ export class WsServer implements ServerTransport {
         voiceState: s.voiceState,
         ...(s.voiceTurnId ? { voiceTurnId: s.voiceTurnId } : {}),
         previewingDraft: s.previewingDraft,
+        isOwner: s.isOwner,
       })
     }
     return out
@@ -713,9 +734,11 @@ export class WsServer implements ServerTransport {
     const session = this.createSession(ws, hello, deviceId)
     this.sessions.set(session.sessionId, session)
 
+    // Developer Mode is advertised only to owner sessions (the server also
+    // enforces it on every dev/draft message).
     const helloOk = msgHelloOk({
       sessionId: session.sessionId,
-      devModeEnabled: this.devModeEnabled,
+      devModeEnabled: this.devModeEnabled && session.isOwner,
     })
     ws.send(toBinary(ServerMessageSchema, helloOk))
 
@@ -747,6 +770,7 @@ export class WsServer implements ServerTransport {
       voiceState: VoiceStateValue.IDLE,
       backpressurePaused: false,
       previewingDraft: new Set<string>(),
+      isOwner: this.ownerResolver(deviceId),
       // activeScope: set by the first ViewingMsg or chatInput.
       // currentFaceParams: set by the broadcast layer via setCurrentFaceMount.
       ...(hello.currentFaceId !== undefined && { currentFaceId: hello.currentFaceId }),

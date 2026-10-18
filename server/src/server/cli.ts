@@ -56,6 +56,7 @@ import { findEntryFile, loadAppModule, validateAppDef } from './agent/app-loader
 import { openPlatformDb } from './db/platform-db.js'
 import { FaceParamsStore } from './agent/face-params-store.js'
 import { ConversationStore } from './conversations/store.js'
+import { ChangeRequestStore } from './change-requests/store.js'
 import { deviceCode } from './conversations/device-code.js'
 import {
   openPairingWindow,
@@ -103,6 +104,9 @@ export async function runCli(argv: string[]): Promise<number> {
       case 'device':
         return await cmdDevice(sub, rest)
 
+      case 'change':
+        return cmdChange(sub, rest)
+
       default:
         stderr.write(`Unknown command: ${cmd}\n\n`)
         printHelp()
@@ -147,11 +151,14 @@ Commands:
   db purge --older-than <Nd>    Delete archived conversations + messages older than N days.
   device pair [--minutes <N>]   Open an enrollment window (default 5m) + interactively approve devices.
   device list [--all]           List devices (paired + pending); --all includes old pending probes.
-  device approve <code|id> [--name <label>]  Approve (pair) a device; optionally name it.
+  device approve <code|id> [--name <label>] [--owner]  Approve (pair) a device; optionally name it; --owner grants Developer Mode.
   device revoke <code|id>       Revoke (un-pair) a device; keeps it listed as pending.
   device forget <code|id>       Delete a device entirely (it returns as pending if it reconnects).
   device rename <code|id> <name>  Set a device's display name.
+  device role <code|id> owner|user  Grant or remove Developer Mode (owner) for a paired device.
   device prune [--older-than <Nd>] [--unpaired] [--all] [--yes]  Bulk-delete stale/junk device rows.
+  change list [--all]           List change requests raised in User Mode (open + in progress; --all includes closed).
+  change reject <number>        Close a change request without building it.
 
 Environment:
   MOUMANTAI_HOME               Override the workspace location (default: ~/.moumantai/).
@@ -596,6 +603,63 @@ async function cmdDbPurge(args: string[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// change — User Mode change requests (handoff to Developer Mode)
+// ---------------------------------------------------------------------------
+
+function cmdChange(sub: string | undefined, args: string[]): number {
+  const home = resolveMoumantaiHome()
+  ensureHomeLayout(home)
+  const platformDb = openPlatformDb(home)
+  const changes = new ChangeRequestStore(platformDb)
+  try {
+    switch (sub) {
+      case 'list':
+      case undefined: {
+        const rows = args.includes('--all') ? changes.listAll() : changes.listActive()
+        if (rows.length === 0) {
+          stdout.write('No change requests.\n')
+          return 0
+        }
+        printTable(
+          ['#', 'APP', 'STATUS', 'DRAFT', 'CREATED', 'REQUEST'],
+          rows.map((cr) => [
+            String(cr.number),
+            cr.appId,
+            cr.status,
+            cr.draftId ? cr.draftId.slice(0, 8) : '-',
+            relTime(cr.createdAt),
+            cr.request.length > 60 ? cr.request.slice(0, 59) + '…' : cr.request,
+          ]),
+        )
+        return 0
+      }
+      case 'reject': {
+        const n = Number(args[0])
+        if (!Number.isInteger(n)) {
+          stderr.write('Usage: task server:cli -- change reject <number>\n')
+          return 2
+        }
+        if (!changes.reject(n)) {
+          stderr.write(`No open change request #${n}.\n`)
+          return 1
+        }
+        stdout.write(`Rejected change request #${n}.\n`)
+        return 0
+      }
+      default:
+        stderr.write(`Unknown change subcommand: ${sub}\nTry: list [--all] | reject <number>\n`)
+        return 2
+    }
+  } finally {
+    try {
+      getNativeClient(platformDb)?.close?.()
+    } catch {
+      /* non-fatal */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // device — pairing (allowlist) management
 // ---------------------------------------------------------------------------
 
@@ -613,11 +677,13 @@ async function cmdDevice(sub: string | undefined, args: string[]): Promise<numbe
       return cmdDeviceForget(args)
     case 'rename':
       return cmdDeviceRename(args)
+    case 'role':
+      return cmdDeviceRole(args)
     case 'prune':
       return await cmdDevicePrune(args)
     default:
       stderr.write(`Unknown device subcommand: ${sub ?? '(missing)'}\n`)
-      stderr.write('Try: pair | list | approve | revoke | forget | rename | prune\n')
+      stderr.write('Try: pair | list | approve | revoke | forget | rename | role | prune\n')
       return 2
   }
 }
@@ -822,6 +888,7 @@ function cmdDeviceList(args: string[]): number {
       const ambiguous = (codeCounts.get(c) ?? 0) > 1
       return [
         d.paired ? 'PAIRED' : 'PENDING',
+        d.paired ? d.role : '-',
         ambiguous ? `${c}*` : c,
         deviceClassLabel(d.deviceClass),
         d.deviceProfileWidth && d.deviceProfileHeight
@@ -832,7 +899,7 @@ function cmdDeviceList(args: string[]): number {
         relTime(d.lastSeenAt),
       ]
     })
-    printTable(['STATUS', 'CODE', 'CLASS', 'SIZE', 'PLATFORM', 'NAME', 'LAST SEEN'], rows)
+    printTable(['STATUS', 'ROLE', 'CODE', 'CLASS', 'SIZE', 'PLATFORM', 'NAME', 'LAST SEEN'], rows)
     if ([...codeCounts.values()].some((n) => n > 1)) {
       stdout.write('\n* code shared by multiple devices — use the full deviceId to disambiguate.\n')
     }
@@ -847,8 +914,11 @@ function cmdDeviceList(args: string[]): number {
 
 function cmdDeviceApprove(args: string[]): number {
   const { token, name } = parseDeviceArgs(args)
+  const owner = args.includes('--owner')
   if (!token) {
-    stderr.write('Usage: task server:cli -- device approve <code|deviceId> [--name <label>]\n')
+    stderr.write(
+      'Usage: task server:cli -- device approve <code|deviceId> [--name <label>] [--owner]\n',
+    )
     return 2
   }
   const { store, close } = openStore()
@@ -861,9 +931,11 @@ function cmdDeviceApprove(args: string[]): number {
     }
     const was = d.paired
     store.setDevicePaired(d.deviceId, true, name)
+    if (owner) store.setDeviceRole(d.deviceId, 'owner')
     const label = name ?? d.deviceLabel
+    const role = owner ? 'owner' : d.role
     stdout.write(
-      `${was ? 'Already paired' : 'Paired'}: ${deviceCode(d.deviceId)} (${d.deviceId})${label ? ` — "${label}"` : ''}\n`,
+      `${was ? 'Already paired' : 'Paired'}: ${deviceCode(d.deviceId)} (${d.deviceId})${label ? ` — "${label}"` : ''} [${role}]\n`,
     )
     return 0
   } finally {
@@ -920,6 +992,31 @@ function cmdDeviceForget(args: string[]): number {
     store.forgetDevice(d.deviceId)
     stdout.write(
       `Forgotten (row deleted): ${deviceCode(d.deviceId)} (${d.deviceId}). It will return as pending if it reconnects.\n`,
+    )
+    return 0
+  } finally {
+    close()
+  }
+}
+
+function cmdDeviceRole(args: string[]): number {
+  const token = args[0]
+  const role = args[1]
+  if (!token || (role !== 'owner' && role !== 'user')) {
+    stderr.write('Usage: task server:cli -- device role <code|deviceId> owner|user\n')
+    return 2
+  }
+  const { store, close } = openStore()
+  try {
+    const d = resolveDeviceArg(store, token)
+    if (d === 'ambiguous') return 2
+    if (!d) {
+      stderr.write(`No device matching '${token}'.\n`)
+      return 1
+    }
+    store.setDeviceRole(d.deviceId, role)
+    stdout.write(
+      `Role of ${deviceCode(d.deviceId)} (${d.deviceId}) → ${role}. Takes effect on its next reconnect.\n`,
     )
     return 0
   } finally {

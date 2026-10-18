@@ -39,6 +39,8 @@ export class TestClient {
   readonly ws: WebSocket
   readonly received: ServerMessage[] = []
   sessionId = ''
+  /** Whether the server advertised Developer Mode to this session (ServerHello). */
+  devModeEnabled = false
 
   private constructor(ws: WebSocket) {
     this.ws = ws
@@ -61,6 +63,7 @@ export class TestClient {
         }
         if (!settled && msg.payload.case === 'helloOk') {
           client.sessionId = msg.payload.value.sessionId
+          client.devModeEnabled = msg.payload.value.devModeEnabled ?? false
           settled = true
           resolve(client)
           return

@@ -235,6 +235,16 @@ export const devices = sqliteTable('devices', {
    * a trust signal.
    */
   deviceUa: text('device_ua'),
+  /**
+   * Principal role of a paired device: 'owner' may use Developer Mode
+   * (dev chat, preview, promote, discard); 'user' gets User Mode only.
+   * Set via `device approve --owner` / `device role`. The introducing
+   * migration grandfathers already-paired devices to 'owner'. Ignored when
+   * pairing is off (trusted local single-user setup: every session is owner).
+   */
+  role: text('role', { enum: ['owner', 'user'] })
+    .notNull()
+    .default('user'),
   /** ISO-8601 of the most recent `ClientHello` from this device. */
   lastSeenAt: text('last_seen_at')
     .notNull()

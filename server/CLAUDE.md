@@ -83,6 +83,8 @@ Run as `task server:cli -- <subcommand>` or `tsx src/server/cli.ts` directly.
 | `app search <query>` | Substring-match id + description across configured registries |
 | `app cache-clear <id> [--yes]` | Wipe an app's asset cache; next refresh repopulates |
 | `registry add <name> <url>` / `list` / `remove <name>` / `update [<name>]` | Manage `config.json:appRegistries` and the git cache |
+| `device approve <code> [--owner]` / `device role <code> owner\|user` | Pair a device / set its role. Only **owner** devices get Developer Mode (dev chat, preview, promote, discard); enforced server-side, applied on reconnect. Pairing off = every session is owner |
+| `change list [--all]` / `change reject <n>` | User Mode change requests (`request_app_change`) awaiting the owner; open requests are handed to the next edit-agent turn for that app |
 
 Install origin written to `<home>/apps-meta/<id>.json`: `{type: 'local', source, linkType}` for path installs; `{type: 'git', url, ref, subdir?, commit}` for git installs. `app update` refreshes only git origins.
 
