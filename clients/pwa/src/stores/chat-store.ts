@@ -160,8 +160,11 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   addMessage: (appId, msg, kind = 'chat') => {
     const key = threadKey(appId, kind)
     set((state) => {
+      const existing = state.messagesByApp.get(key) ?? []
+      // Server notices (e.g. change requests) can be re-sent on reconnect or
+      // app switch with the same id — keep the thread free of duplicates.
+      if (existing.some((m) => m.id === msg.id)) return state
       const byApp = new Map(state.messagesByApp)
-      const existing = byApp.get(key) ?? []
       byApp.set(key, [...existing, msg])
       return { messagesByApp: byApp }
     })
