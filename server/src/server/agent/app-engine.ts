@@ -80,8 +80,9 @@ export interface BootedApp {
 }
 
 /** Derive wire-safe tool schemas from the registry. Single source of truth. */
+/** Tool schemas offered to agents — UI-only tools are excluded. */
 export function getToolSchemas(app: BootedApp) {
-  return [...app.toolRegistry.values()].map(toToolSchema)
+  return [...app.toolRegistry.values()].filter((t) => !t.uiOnly).map(toToolSchema)
 }
 
 // ---------------------------------------------------------------------------

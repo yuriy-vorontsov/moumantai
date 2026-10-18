@@ -144,7 +144,9 @@ export class AgentLoop {
             break
 
           case 'toolCall': {
-            const tool = this.deps.toolRegistry.get(event.name)
+            const found = this.deps.toolRegistry.get(event.name)
+            // UI-only tools are never callable by an agent, even by guessed name.
+            const tool = found?.uiOnly ? undefined : found
             let result: ToolResult
 
             if (tool) {

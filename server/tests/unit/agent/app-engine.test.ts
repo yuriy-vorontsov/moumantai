@@ -187,6 +187,22 @@ describe('AppEngine', () => {
       expect(app.toolRegistry.has('dyn')).toBe(false)
       expect(getToolSchemas(app).find((s) => s.name === 'dyn')).toBeUndefined()
     })
+
+    it('uiOnly tools stay in the registry (UI actions) but are never offered to the model', async () => {
+      const engine = new AppEngine()
+      engine.register(makeMinimalApp('a'))
+      await engine.boot('a')
+      const app = engine.getApp('a')!
+      engine.addTool('a', {
+        name: 'ui_action',
+        description: 'button only',
+        parameters: {},
+        uiOnly: true,
+        execute: async () => ({ result: 'ok' }),
+      })
+      expect(app.toolRegistry.has('ui_action')).toBe(true)
+      expect(getToolSchemas(app).find((s) => s.name === 'ui_action')).toBeUndefined()
+    })
   })
 
   describe('getApp + shutdown', () => {

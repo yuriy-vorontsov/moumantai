@@ -238,6 +238,23 @@ describe('AgentLoop', () => {
         error: 'Unknown tool: nonexistent',
       })
     })
+
+    it('treats a uiOnly tool as unknown: an agent cannot call a UI-only action', async () => {
+      const adapter = new ScriptedAdapter()
+      const execute = vi.fn(async () => ({ result: { restored: true } }))
+      adapter.setEvents([
+        { type: 'toolCall', callId: 'c1', name: 'restore_release', args: { release_id: 'r1' } },
+        { type: 'done' },
+      ])
+
+      const { loop } = makeLoop(adapter, [
+        { ...makeTool('restore_release', execute), uiOnly: true },
+      ])
+      const result = await loop.runTurn(makeRequest())
+
+      expect(execute).not.toHaveBeenCalled()
+      expect(result.toolCalls[0].result).toBe('Unknown tool: restore_release')
+    })
   })
 
   describe('adapter error event', () => {

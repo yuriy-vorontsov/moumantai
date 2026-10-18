@@ -199,6 +199,11 @@ export interface ToolSchema {
 /** Full tool definition. `execute` stays server-side; only `ToolSchema` is sent to the adapter. */
 export interface ToolDefinition extends ToolSchema {
   execute: (ctx: ToolContext) => Promise<ToolResult>
+  /**
+   * UI-only tool: invocable from a face action, never offered to or callable
+   * by an agent (owner controls like release restore). Framework-internal.
+   */
+  uiOnly?: boolean
 }
 
 /** Extract wire-safe ToolSchema from a ToolDefinition. */
