@@ -17,7 +17,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import type { AgentRequest, AppContext, PermissionCallback, PermissionResult } from './types.js'
-import { buildEditMcpTools } from './edit-mcp-tools.js'
+import { buildEditMcpTools, type EditMcpToolsDeps } from './edit-mcp-tools.js'
 import type { DraftKindStr } from '../drafts/types.js'
 
 // ---------------------------------------------------------------------------
@@ -509,7 +509,12 @@ function buildEditSystemPrompt(opts: {
     'to do it (including the plan-first rule for non-trivial changes).',
     '',
     'When the draft is ready, call request_promote_review with a one-paragraph',
-    'summary. The user — not you — decides Promote or Discard via the PWA.',
+    'summary. It runs the full release checks (manifest, dependencies, faces and',
+    "tools, types, additive-only migrations, the app's own tests in a sandbox,",
+    'tool changes) and lists anything that failed — fix and call it again.',
+    'Bump manifest.version (MAJOR.MINOR.PATCH) above the live version for every',
+    'change, and keep tests/ in step with what you change. The user — not you —',
+    'decides Promote or Discard via the PWA.',
   )
   if (changeRequests.length > 0) {
     lines.push(
@@ -555,6 +560,8 @@ export interface BuildEditAgentRequestOpts {
   markReadyForReview: (summary: string) => void
   /** Open User Mode change requests linked to this draft (spec §8.1). */
   changeRequests?: EditChangeRequest[]
+  /** Full release validation for request_promote_review (see EditMcpToolsDeps). */
+  runReleasePipeline?: EditMcpToolsDeps['runReleasePipeline']
 }
 
 // SDK `tools` = built-ins to ENABLE. NOT auto-approved — the PreToolUse hook
@@ -613,6 +620,7 @@ export function buildEditAgentRequest(opts: BuildEditAgentRequestOpts): AgentReq
     draftDir: opts.draftDir,
     shadowDbPath: opts.shadowDbPath,
     markReadyForReview: opts.markReadyForReview,
+    ...(opts.runReleasePipeline ? { runReleasePipeline: opts.runReleasePipeline } : {}),
     // validate_types: live baseline for diff-scoping (null for new-app) + paths.
     liveSrcDir: opts.liveAppId ? path.join(opts.appsSrcDir, opts.liveAppId) : null,
     home: opts.home,

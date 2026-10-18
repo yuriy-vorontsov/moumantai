@@ -29,6 +29,9 @@ import { scaffoldNewAppDraft } from './draft-scaffold.js'
 import { cloneLiveDbToShadow, createEmptyShadow } from './draft-db.js'
 import { promoteDraft as runPromote } from './draft-promote.js'
 import type { DraftMeta, DraftActionOutcome, DraftKindStr } from './types.js'
+import type { ReleaseStore } from '../releases/store.js'
+import type { PipelineResult } from '../releases/pipeline.js'
+import { pointerPath } from '../releases/publish.js'
 
 export interface DraftStoreDeps {
   home: string
@@ -47,6 +50,16 @@ export interface DraftStoreDeps {
   }) => void
   /** Injected clock (testability). Defaults to `() => new Date()`. */
   now?: () => Date
+  /** Release bookkeeping (validation runs, approvals, releases, events). */
+  releases: ReleaseStore
+  /** Run the validation pipeline for a draft (spec §7.3). */
+  validateDraft: (draftId: string, meta: DraftMeta) => Promise<PipelineResult>
+  /**
+   * Activate an app from its release pointer (`<home>/apps-src/<id>`).
+   * Defaults to a bundled reload + swap/register; the server passes its own
+   * so it can also update its appId → appDir map.
+   */
+  activateApp?: (appId: string, kind: 'edit' | 'new-app') => Promise<void>
 }
 
 export type CreateDraftOpts = { kind: 'edit'; appId: string } | { kind: 'new-app' }
@@ -134,6 +147,14 @@ export class DraftStore {
         await this.deps.draftRegistry.boot(draftId)
       }
 
+      this.deps.releases.event({
+        subjectType: 'draft',
+        subjectId: draftId,
+        appId,
+        state: 'DRAFTING',
+        actor: 'owner',
+        detail: opts.kind,
+      })
       return { draftId, conversationId: conv.id, meta }
     } catch (err) {
       // Rollback: remove the partial worktree and archive the dev conversation
@@ -179,6 +200,16 @@ export class DraftStore {
   /** Set ready-for-review + summary (request_promote_review, all validators passed). */
   markReadyForReview(draftId: string, summary: string): void {
     this.updateMeta(draftId, (m) => ({ ...m, readyForReview: true, summary }))
+    const meta = this.readMeta(draftId)
+    if (meta) {
+      this.deps.releases.event({
+        subjectType: 'draft',
+        subjectId: draftId,
+        appId: meta.appId,
+        state: 'REVIEW_PENDING',
+        actor: 'agent',
+      })
+    }
   }
 
   /** Bump message count + last-message time (per dev-chat message). */
@@ -238,8 +269,14 @@ export class DraftStore {
   // Promote / Discard
   // -------------------------------------------------------------------------
 
-  /** Promote a draft. Holds the per-draft lock for the duration. */
-  async promoteDraft(draftId: string): Promise<DraftActionOutcome> {
+  /**
+   * Promote (publish) a draft as an immutable release. `principal` is the
+   * approving owner (device id, or 'cli'). Holds the per-draft lock.
+   */
+  async promoteDraft(
+    draftId: string,
+    opts: { principal?: string } = {},
+  ): Promise<DraftActionOutcome> {
     const meta = this.readMeta(draftId)
     if (!meta) return { ok: false, error: `draft "${draftId}" not found` }
     if (this.promoteInFlight.has(draftId)) {
@@ -251,10 +288,13 @@ export class DraftStore {
         {
           home: this.deps.home,
           draftRegistry: this.deps.draftRegistry,
-          liveSrcDir: (appId) =>
-            this.deps.appEngine.getApp(appId)?.appDir ??
-            path.join(homeLayout(this.deps.home).appsSrcDir, appId),
           liveDbPath: (appId) => appPaths(this.deps.home, appId).dbFile,
+          liveApp: (appId) => {
+            const app = this.deps.appEngine.getApp(appId)
+            if (!app) return undefined
+            const dir = app.appDir ?? pointerPath(this.deps.home, appId)
+            return { version: app.manifest.version, migrationsFolder: path.join(dir, 'drizzle') }
+          },
           existingAppIds: (excludeDraftId) => {
             const ids = new Set(this.deps.appEngine.listApps().map((m) => m.id))
             for (const d of this.deps.draftRegistry.listActiveDrafts()) {
@@ -262,25 +302,12 @@ export class DraftStore {
             }
             return ids
           },
-          activateLive: async (appId, kind) => {
-            const srcDir =
-              this.deps.appEngine.getApp(appId)?.appDir ??
-              path.join(homeLayout(this.deps.home).appsSrcDir, appId)
-            // Bundle-load so a promote of edits to PRE-EXISTING files (resolve.ts,
-            // schema.ts, …) activates the new code — `reloadSingleApp` would
-            // stale-load those children from the live app's boot-time cache.
-            // Scratch goes in <home>/tmp (not a watched appDir).
-            const entry = findEntryFile(srcDir)
-            if (!entry) throw new Error(`No index.ts/js in ${srcDir} after promote copy`)
-            const def = await reloadAppBundled(entry, path.join(this.deps.home, 'tmp'))
-            if (kind === 'edit') {
-              await this.deps.appEngine.swapApp(def)
-            } else {
-              this.deps.appEngine.register(def)
-              await this.deps.appEngine.boot(appId)
-            }
-          },
+          activateLive:
+            this.deps.activateApp ?? ((appId, kind) => this.activateFromPointer(appId, kind)),
           recordPromotion: this.deps.recordPromotion,
+          releases: this.deps.releases,
+          validate: () => this.deps.validateDraft(draftId, meta),
+          principal: opts.principal ?? 'unknown',
           now: this.now,
         },
         draftId,
@@ -294,13 +321,44 @@ export class DraftStore {
   }
 
   /**
+   * Default activation: bundle-load the app from its release pointer so edits
+   * to PRE-EXISTING files (resolve.ts, schema.ts, …) take effect —
+   * `reloadSingleApp` would stale-load them from the boot-time module cache.
+   * Scratch goes in <home>/tmp (not a watched appDir).
+   */
+  async activateFromPointer(appId: string, kind: 'edit' | 'new-app'): Promise<void> {
+    const srcDir = pointerPath(this.deps.home, appId)
+    const entry = findEntryFile(srcDir)
+    if (!entry) throw new Error(`No index.ts/js in ${srcDir}`)
+    const def = await reloadAppBundled(entry, path.join(this.deps.home, 'tmp'))
+    if (kind === 'edit') {
+      await this.deps.appEngine.swapApp(def)
+    } else {
+      this.deps.appEngine.register(def)
+      await this.deps.appEngine.boot(appId)
+    }
+  }
+
+  /**
    * Discard a draft: archive its dev conversation, unregister (closes shadow
    * DB), remove the worktree. Rejected while a promote holds the lock.
    * Caller must abort any in-flight agent turn first.
    */
-  discardDraft(draftId: string): DraftActionOutcome {
+  discardDraft(draftId: string, opts: { principal?: string } = {}): DraftActionOutcome {
     if (this.promoteInFlight.has(draftId)) {
       return { ok: false, error: 'Promote in progress — try again in a moment' }
+    }
+    const meta = this.readMeta(draftId)
+    if (meta) {
+      const principal = opts.principal ?? 'unknown'
+      this.deps.releases.approve({ principal, target: `draft:${draftId}`, decision: 'rejected' })
+      this.deps.releases.event({
+        subjectType: 'draft',
+        subjectId: draftId,
+        appId: meta.appId,
+        state: 'DISCARDED',
+        actor: principal,
+      })
     }
     this.archiveDevConversation(draftId)
     this.deps.draftRegistry.unregister(draftId)

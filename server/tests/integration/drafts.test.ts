@@ -18,6 +18,9 @@ import { FaceParamsStore } from '../../src/server/agent/face-params-store.js'
 import { DraftRegistry } from '../../src/server/drafts/draft-registry.js'
 import { DraftStore } from '../../src/server/drafts/draft-store.js'
 import { countDataRows } from '../../src/server/drafts/draft-db.js'
+import { ReleaseStore } from '../../src/server/releases/store.js'
+import { contentHash } from '../../src/server/releases/hash.js'
+import type { PipelineResult } from '../../src/server/releases/pipeline.js'
 import {
   homeLayout,
   appPaths,
@@ -51,6 +54,9 @@ interface TestHarness {
     msgCount: number
   }>
   draftStore: DraftStore
+  releases: ReleaseStore
+  /** Next validateDraft outcome; the pipeline itself is covered by releases tests. */
+  validation: { ok: boolean }
 }
 
 async function buildHarness(): Promise<TestHarness> {
@@ -80,6 +86,8 @@ async function buildHarness(): Promise<TestHarness> {
   })
 
   const promotions: TestHarness['promotions'] = []
+  const releases = new ReleaseStore(platformDb)
+  const validation = { ok: true }
 
   const draftStore = new DraftStore({
     home,
@@ -90,6 +98,24 @@ async function buildHarness(): Promise<TestHarness> {
     recordPromotion: (p) => {
       promotions.push(p)
     },
+    releases,
+    validateDraft: async (draftId): Promise<PipelineResult> => ({
+      ok: validation.ok,
+      contentHash: contentHash(draftPaths(home, draftId).dir),
+      fromVersion: '1.0.0',
+      toVersion: '1.0.0',
+      steps: [
+        {
+          name: 'tests',
+          ok: validation.ok,
+          summary: validation.ok ? 'passed' : '1 failing test',
+          durationMs: 0,
+        },
+      ],
+      toolDiff: null,
+      migrationPlan: null,
+      files: [],
+    }),
   })
 
   return {
@@ -101,6 +127,8 @@ async function buildHarness(): Promise<TestHarness> {
     draftRegistry,
     promotions,
     draftStore,
+    releases,
+    validation,
   }
 }
 
@@ -321,6 +349,32 @@ describe('drafts integration', () => {
     // Shadow's extra row must not have been promoted into live.
     const liveDb = appPaths(h.home, 'test-app').dbFile
     expect(countDataRows(liveDb)).toBe(N)
+
+    // Release workflow: the pre-release source became a restorable baseline,
+    // the draft became the active release, and the pointer targets its artifact.
+    const history = h.releases.list('test-app')
+    expect(history.map((r) => [r.source, r.status])).toEqual([
+      ['draft', 'active'],
+      ['baseline', 'superseded'],
+    ])
+    const pointer = path.join(homeLayout(h.home).appsSrcDir, 'test-app')
+    expect(fs.lstatSync(pointer).isSymbolicLink()).toBe(true)
+    expect(fs.realpathSync(pointer)).toBe(fs.realpathSync(history[0]!.artifactDir))
+    expect(contentHash(history[0]!.artifactDir)).toBe(history[0]!.contentHash)
+  })
+
+  it('EDIT promoteDraft: failing validation blocks publication and leaves the draft in place', async () => {
+    const { draftId } = await h.draftStore.createDraft({ kind: 'edit', appId: 'test-app' })
+    h.validation.ok = false
+
+    const outcome = await h.draftStore.promoteDraft(draftId)
+    expect(outcome.ok).toBe(false)
+    expect(outcome.ok === false && outcome.error).toContain('Publication blocked')
+
+    expect(fs.existsSync(draftPaths(h.home, draftId).dir)).toBe(true)
+    expect(h.draftRegistry.get(draftId)).toBeTruthy()
+    expect(h.releases.list('test-app')).toEqual([])
+    expect(h.promotions).toHaveLength(0)
   })
 
   it('discardDraft: worktree removed; registry entry gone; dev conversation archived', async () => {

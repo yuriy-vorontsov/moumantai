@@ -6,6 +6,7 @@ export default defineConfig({
     './src/server/conversations/schema.ts',
     './src/server/drafts/promotions-schema.ts',
     './src/server/change-requests/schema.ts',
+    './src/server/releases/schema.ts',
   ],
   out: './drizzle/platform',
   casing: 'snake_case',

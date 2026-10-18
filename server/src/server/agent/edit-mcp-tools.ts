@@ -40,6 +40,27 @@ export interface EditMcpToolsDeps {
   liveSrcDir: string | null // live app source for the diff baseline; null for new-app
   home: string // Moumantai home (scratch tsconfig under <home>/tmp)
   repoRoot: string // holds apps/tsconfig.json + tsconfig.base.json
+  /**
+   * Full release validation pipeline (mutabl spec §7.3: manifest, deps,
+   * faces/tools, types, migrations, previous release on new schema, sandboxed
+   * tests, tool permissions). When set, request_promote_review uses it instead
+   * of the built-in face/tool/type subset, and a passing run is what Promote
+   * publishes.
+   */
+  runReleasePipeline?: () => Promise<ReleasePipelineOutcome>
+}
+
+export interface ReleasePipelineOutcome {
+  ok: boolean
+  /** Human-readable step table (also posted to the owner's Dev thread). */
+  report: string
+  failed: { step: string; summary: string }[]
+}
+
+const STEP_KIND: Record<string, ValidationError['kind']> = {
+  'faces and tools': 'face',
+  migrations: 'schema',
+  'previous release on new schema': 'schema',
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +151,7 @@ function deriveMigrationsFolder(draftDir: string): string {
 // Internal helpers reused by request_promote_review
 // ---------------------------------------------------------------------------
 
-async function validateFaceById(
+export async function validateFaceById(
   draftDir: string,
   shadowDbPath: string,
   faceId: string,
@@ -259,7 +280,7 @@ async function validateFaceById(
  * file not found" failures that pushed authors to rename files to match. The
  * loaded object is the source of truth; the on-disk filename is irrelevant.
  */
-function validateToolShape(toolName: string, toolDef: unknown): ValidationResult {
+export function validateToolShape(toolName: string, toolDef: unknown): ValidationResult {
   if (!toolDef || typeof toolDef !== 'object') {
     return {
       ok: false,
@@ -293,6 +314,7 @@ function validateToolShape(toolName: string, toolDef: unknown): ValidationResult
 
 export function buildEditMcpTools(deps: EditMcpToolsDeps): unknown[] {
   const { draftId, draftDir, shadowDbPath, markReadyForReview, liveSrcDir, home, repoRoot } = deps
+  const { runReleasePipeline } = deps
 
   // One bounded outcome line per tool call — the highest-value debug signal for
   // "is the edit-agent converging or looping on a failing validator?".
@@ -538,6 +560,27 @@ export function buildEditMcpTools(deps: EditMcpToolsDeps): unknown[] {
     'Validate the draft (loads the app, validates every face + tool, and runs a diff-scoped typecheck). If all pass, mark the draft ready for review. Returns ValidationResult.',
     { summary: z.string().describe('One-paragraph summary of what was built / changed') },
     async ({ summary }: { summary: string }) => {
+      if (runReleasePipeline) {
+        const outcome = await runReleasePipeline()
+        if (!outcome.ok) {
+          log(
+            `request_promote_review ok=false (release pipeline: ${outcome.failed.map((f) => f.step).join(', ')})`,
+          )
+          return errContent({
+            ok: false,
+            errors: outcome.failed.map((f) => ({
+              target: f.step,
+              kind: STEP_KIND[f.step] ?? 'typecheck',
+              message: f.summary,
+            })),
+            report: outcome.report,
+          })
+        }
+        log('request_promote_review ok=true (release pipeline)')
+        markReadyForReview(summary)
+        return okContent({ ok: true, report: outcome.report })
+      }
+
       const allErrors: ValidationError[] = []
 
       // --- Load the app def to enumerate faces + tools ---

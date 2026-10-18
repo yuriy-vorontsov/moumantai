@@ -5,15 +5,15 @@
 ## Public API
 
 ### `DraftStore` (`draft-store.ts`) — the surface the rest of the server uses
-- `new DraftStore(deps)` — deps: `{ home, draftRegistry, conversationStore, appEngine, skillsRepoDir, recordPromotion, now? }`.
+- `new DraftStore(deps)` — deps: `{ home, draftRegistry, conversationStore, appEngine, skillsRepoDir, recordPromotion, releases, validateDraft, activateApp?, now? }` (`releases` + `validateDraft` come from `releases/`).
 - `createDraft(opts: { kind: 'edit'; appId } | { kind: 'new-app' }): Promise<{ draftId, conversationId, meta }>` — materializes the worktree (edit: copy live source + clone live DB → shadow; new-app: empty), materializes the relevant skill, writes `.meta.json` last, creates the linked `kind='dev'` conversation, and (edit only) registers + boots the draft. New-app drafts boot on first reload.
 - `getDraft(draftId): DraftMeta | undefined` / `getDraftByApp(appId)` / `listActiveDrafts(): DraftMeta[]`.
 - `markDirty(draftId)` — clears `readyForReview` (every new dev-chat message).
 - `markReadyForReview(draftId, summary)` — sets `readyForReview=true` + summary (request_promote_review, all validators passed).
 - `incrementMsgCount(draftId)` / `updateAppId(draftId, appId)`.
 - `reloadDraft(draftId): Promise<{ ok, error?, appId? }>` — `[Reload preview]`. Boots a new-app draft on first call; detects the agent-chosen `manifest.id` and updates metadata when it changes.
-- `promoteDraft(draftId): Promise<{ ok, error? }>` — holds the per-draft promote lock; delegates to `draft-promote`.
-- `discardDraft(draftId): { ok, error? }` — archives the dev conversation, unregisters (closes shadow DB), removes the worktree. Rejected while a promote is in flight. Caller aborts any in-flight agent turn first.
+- `promoteDraft(draftId, { principal }): Promise<{ ok, error? }>` — holds the per-draft promote lock; delegates to `draft-promote` (publishes an immutable release — see `releases/spec.md`).
+- `discardDraft(draftId, { principal }): { ok, error? }` — records a `rejected` approval + `DISCARDED` event, archives the dev conversation, unregisters (closes shadow DB), removes the worktree. Rejected while a promote is in flight. Caller aborts any in-flight agent turn first.
 
 ### `DraftRegistry` (`draft-registry.ts`) — booted state, separate from AppEngine
 - `register(draftId, appDef, { appId, kind, draftDir })`, `boot(draftId)`, `swap(draftId, newAppDef)`, `reload(draftId): Promise<{ appId }>`, `unregister(draftId)`, `get(draftId)`, `hasOptedInClients(draftId)`, `listActiveDrafts()`, `listNewAppDrafts()`, `shutdown()`.
@@ -22,7 +22,7 @@
 ### Helpers
 - `draft-fs.ts`: `materializeDraftWorktree`, `materializeSkill`, `mirrorInto(srcDir, destDir)` (makes dest's promotable subset identical to src — copy + add + prune orphans; excludes ephemerals + `.git`; resolves a symlinked dev `apps-src/<id>` dest), `snapshotDir`, `removeDraftWorktree`, `removeTmpPath`, `isEphemeralDraftPath(rel)`.
 - `draft-db.ts`: `cloneLiveDbToShadow` (consistent `VACUUM INTO` clone — handles the live WAL), `createEmptyShadow`, `applyMigrations`, `countDataRows` (excludes `cache_*` / `__drizzle_*` / `sqlite_*`).
-- `draft-promote.ts`: `promoteDraft(deps, draftId, meta)` — pre-flight migration on a throwaway live clone → snapshot → migrate live → `mirrorInto` worktree (ephemerals excluded; prunes deleted/renamed files) → activate → record → cleanup, with a `mirrorInto` rollback from the snapshot on post-copy failure. Activation bundle-loads the live source so promoted edits to non-entry files take effect. New-app skips the DB steps and runs a manifest.id collision check. Known gap: the live DB migration is forward-only — a copy/activate failure after migration leaves the new schema with the old source (mitigated by the mirror restore; flagged, not auto-reverted).
+- `draft-promote.ts`: `promoteDraft(deps, draftId, meta)` — publish a draft as an immutable release: approval bound to the content hash → validation pipeline (reused when a passing run exists for exactly this content) → baseline capture on first publish → content-addressed artifact → pre-flight migration on a throwaway live clone → backup + migrate live → atomic pointer switch → activate, pointing back at the previous release if activation fails. New-app skips the DB steps and runs a manifest.id collision check. Details and the restore path: `releases/spec.md`.
 - `promotions-schema.ts`: `promotions` table on platform.db (append-only audit log; one row per promote).
 
 ## Dependencies

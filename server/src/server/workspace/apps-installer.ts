@@ -493,7 +493,7 @@ function compareSemver(a: string, b: string): number {
   return aMaj - bMaj || aMin - bMin || aPat - bPat
 }
 
-const ENGINE_VERSION: string = (() => {
+export const ENGINE_VERSION: string = (() => {
   try {
     const here = path.dirname(fileURLToPath(import.meta.url))
     // src/server/workspace/ → server/package.json

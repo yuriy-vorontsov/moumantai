@@ -19,6 +19,7 @@
 
 import { createServer } from 'http'
 import fs from 'node:fs'
+import os from 'node:os'
 import { resolve as resolvePath } from 'node:path'
 import { loadConfig } from './config.js'
 
@@ -67,6 +68,7 @@ import {
   discoverApps,
   applySupplementalScan,
   findEntryFile,
+  reloadAppBundled,
 } from './agent/app-loader.js'
 import { FaceRegistry } from './agent/face-loader.js'
 import type { DraftMeta } from './drafts/types.js'
@@ -85,6 +87,15 @@ import {
   synthesizeChangeRequestTool,
 } from './agent/synthesize-change-request-tool.js'
 import { ChangeRequestStore } from './change-requests/store.js'
+import { ReleaseStore } from './releases/store.js'
+import {
+  formatReport,
+  runValidationPipeline,
+  type PipelineContext,
+  type PipelineResult,
+} from './releases/pipeline.js'
+import { pointerPath } from './releases/publish.js'
+import { ENGINE_VERSION } from './workspace/apps-installer.js'
 import type { ChangeRequest } from './change-requests/schema.js'
 import { createHttpClient } from './framework/http-client.js'
 import { createAssetCache, tryServeAssetRequest } from './framework/asset-cache.js'
@@ -281,6 +292,7 @@ export async function createAppServer(
   const platformDb = openPlatformDb(home)
   const store = new ConversationStore(platformDb)
   const changeRequestStore = new ChangeRequestStore(platformDb)
+  const releaseStore = new ReleaseStore(platformDb)
   const faceParamsStore = new FaceParamsStore(platformDb)
   const dedupStore = new DedupStore(platformDb)
   // Background sweep for stale dedup rows; cleared at server close.
@@ -416,6 +428,56 @@ export async function createAppServer(
   let draftStore: DraftStore | undefined
   let runDevTurn: ((sessionId: string, msg: ChatInput) => Promise<void>) | undefined
 
+  // Activate an app from its release pointer `<home>/apps-src/<id>` (publish +
+  // restore). Bundled reload so edits to non-entry files take effect; the
+  // appId → appDir map is updated first so the post-boot rewire scans it.
+  const activateApp = async (appId: string, kind: 'edit' | 'new-app'): Promise<void> => {
+    const dir = pointerPath(home, appId)
+    pluginAppDirs.set(appId, dir)
+    const entry = findEntryFile(dir)
+    if (!entry) throw new Error(`No index.ts/js in ${dir}`)
+    const def = await reloadAppBundled(entry, resolvePath(home, 'tmp'))
+    if (kind === 'edit') {
+      await appEngine.swapApp(def)
+    } else {
+      appEngine.register(def)
+      await appEngine.boot(appId)
+    }
+    refreshHealthBody()
+  }
+
+  // Paths the sandboxed draft tests must never read: this server's home
+  // (credentials, data) and the usual credential stores.
+  const sandboxDenyRead = [
+    home,
+    ...['.ssh', '.claude', '.config', '.aws', '.gnupg', 'Library/Keychains'].map((d) =>
+      resolvePath(os.homedir(), d),
+    ),
+  ]
+
+  /** Validation-pipeline context for a draft (spec §7.3). */
+  const pipelineContextFor = (
+    draftId: string,
+    kind: 'edit' | 'new-app',
+    appId: string,
+  ): PipelineContext => {
+    const dp = draftPaths(home, draftId)
+    const live = kind === 'edit' ? appEngine.getApp(appId) : undefined
+    const liveDir = live ? (live.appDir ?? pointerPath(home, appId)) : null
+    return {
+      draftId,
+      kind,
+      draftDir: dp.dir,
+      shadowDbPath: dp.shadowDbFile,
+      home,
+      repoRoot: resolvePath(process.cwd(), '..'),
+      activeDir: liveDir && fs.existsSync(liveDir) ? fs.realpathSync(liveDir) : null,
+      liveDbPath: kind === 'edit' ? appPaths(home, appId).dbFile : null,
+      denyRead: sandboxDenyRead,
+      engineVersion: ENGINE_VERSION,
+    }
+  }
+
   if (config.devModeEnabled) {
     const devInflight = new Map<string, AbortController>() // draftId -> in-flight edit turn
 
@@ -445,6 +507,10 @@ export async function createAppServer(
           })
           .run()
       },
+      releases: releaseStore,
+      validateDraft: (draftId, meta) =>
+        runValidationPipeline(pipelineContextFor(draftId, meta.kind, meta.appId)),
+      activateApp,
     })
     draftStore = drafts
 
@@ -622,6 +688,43 @@ export async function createAppServer(
         message: msg.text,
         kind,
         changeRequests: changeRequests.map((cr) => ({ number: cr.number, request: cr.request })),
+        // request_promote_review runs the full release pipeline (spec §7.3);
+        // a passing run is stored so Promote can publish this exact content.
+        runReleasePipeline: async () => {
+          const result: PipelineResult = await runValidationPipeline(
+            pipelineContextFor(draftId, kind, liveAppId ?? meta!.appId),
+          )
+          releaseStore.recordRun({
+            draftId,
+            appId: liveAppId ?? meta!.appId,
+            contentHash: result.contentHash,
+            ok: result.ok,
+            steps: result,
+          })
+          releaseStore.event({
+            subjectType: 'draft',
+            subjectId: draftId,
+            appId: liveAppId ?? meta!.appId,
+            state: result.ok ? 'VALIDATED' : 'VALIDATION_FAILED',
+            actor: 'agent',
+          })
+          const report = formatReport(result)
+          if (result.ok) {
+            // The owner's review card: versions, files, checks.
+            store.appendTurn(conversationId, {
+              role: 'assistant',
+              text: report,
+              turnMode: 'direct_user_chat',
+            })
+          }
+          return {
+            ok: result.ok,
+            report,
+            failed: result.steps
+              .filter((st) => !st.ok)
+              .map((st) => ({ step: st.name, summary: st.summary })),
+          }
+        },
         draftDir: dp.dir,
         appsSrcDir: homeLayout(home).appsSrcDir,
         shadowDbPath: dp.shadowDbFile,
@@ -780,7 +883,19 @@ export async function createAppServer(
     wsServer.onDraftPromote(async (sessionId, m) => {
       if (rejectNonOwner(sessionId, m.draftId)) return
       const meta = drafts.getDraft(m.draftId)
-      const res = await drafts.promoteDraft(m.draftId)
+      const principal = wsServer.getDeviceId(sessionId) ?? sessionId
+      const res = await drafts.promoteDraft(m.draftId, { principal })
+      if (!res.ok) {
+        // Full report (validation table / failure reason) where the owner reads it.
+        const conv = store.findDevConversationByDraft(m.draftId)
+        if (conv) {
+          store.appendTurn(conv.id, {
+            role: 'assistant',
+            text: res.error,
+            turnMode: 'direct_user_chat',
+          })
+        }
+      }
       wsServer.send(
         sessionId,
         msgDraftActionResult({
@@ -803,7 +918,9 @@ export async function createAppServer(
       if (rejectNonOwner(sessionId, m.draftId)) return
       const meta = drafts.getDraft(m.draftId)
       devInflight.get(m.draftId)?.abort()
-      const res = drafts.discardDraft(m.draftId)
+      const res = drafts.discardDraft(m.draftId, {
+        principal: wsServer.getDeviceId(sessionId) ?? sessionId,
+      })
       if (res.ok) changeRequestStore.releaseDraft(m.draftId)
       wsServer.send(
         sessionId,
@@ -938,7 +1055,12 @@ export async function createAppServer(
     })
     if (isDev) {
       for (const c of wsServer.getLiveConnections()) {
-        if (c.deviceClass === DeviceClass.PHONE && wsServer.getActiveScope(c.sessionId) === scope) {
+        // Dev-thread rows go to owner sessions only (Developer Mode is owner-only).
+        if (
+          c.deviceClass === DeviceClass.PHONE &&
+          c.isOwner &&
+          wsServer.getActiveScope(c.sessionId) === scope
+        ) {
           wsServer.send(c.sessionId, msg)
         }
       }
@@ -961,7 +1083,12 @@ export async function createAppServer(
     })
     if (isDev) {
       for (const c of wsServer.getLiveConnections()) {
-        if (c.deviceClass === DeviceClass.PHONE && wsServer.getActiveScope(c.sessionId) === scope) {
+        // Dev-thread rows go to owner sessions only (Developer Mode is owner-only).
+        if (
+          c.deviceClass === DeviceClass.PHONE &&
+          c.isOwner &&
+          wsServer.getActiveScope(c.sessionId) === scope
+        ) {
           wsServer.send(c.sessionId, msg)
         }
       }
@@ -986,7 +1113,12 @@ export async function createAppServer(
         kind: 'dev',
       })
       for (const c of wsServer.getLiveConnections()) {
-        if (c.deviceClass === DeviceClass.PHONE && wsServer.getActiveScope(c.sessionId) === scope) {
+        // Dev-thread rows go to owner sessions only (Developer Mode is owner-only).
+        if (
+          c.deviceClass === DeviceClass.PHONE &&
+          c.isOwner &&
+          wsServer.getActiveScope(c.sessionId) === scope
+        ) {
           wsServer.send(c.sessionId, emptyDev)
         }
       }
