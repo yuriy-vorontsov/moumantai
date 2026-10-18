@@ -8,6 +8,7 @@
 import type { ToolDefinition, ToolParameter } from './types.js'
 
 const VALID_PARAM_TYPES = new Set(['string', 'number', 'boolean'])
+const VALID_RISKS = new Set(['read', 'write', 'destructive', 'external'])
 
 /**
  * Define a tool that the LLM can call.
@@ -32,6 +33,10 @@ export function defineTool(spec: {
   description: string
   parameters: Record<string, ToolParameter>
   execute: ToolDefinition['execute']
+  /** 'read' | 'write' (default) | 'destructive' | 'external' — see ToolRisk. */
+  risk?: ToolDefinition['risk']
+  /** Human sentence shown when an agent call needs approval. */
+  approvalSummary?: ToolDefinition['approvalSummary']
 }): ToolDefinition {
   if (!spec.name || typeof spec.name !== 'string') {
     throw new Error('defineTool: name is required and must be a string')
@@ -44,6 +49,12 @@ export function defineTool(spec: {
   }
   if (typeof spec.execute !== 'function') {
     throw new Error('defineTool: execute is required and must be a function')
+  }
+
+  if (spec.risk !== undefined && !VALID_RISKS.has(spec.risk)) {
+    throw new Error(
+      `defineTool: risk "${spec.risk}" is invalid. Must be one of: ${[...VALID_RISKS].join(', ')}`,
+    )
   }
 
   // Validate parameter types
@@ -61,5 +72,7 @@ export function defineTool(spec: {
     description: spec.description,
     parameters: spec.parameters,
     execute: spec.execute,
+    ...(spec.risk ? { risk: spec.risk } : {}),
+    ...(spec.approvalSummary ? { approvalSummary: spec.approvalSummary } : {}),
   })
 }

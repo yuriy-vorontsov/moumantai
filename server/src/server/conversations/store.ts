@@ -269,7 +269,14 @@ export class ConversationStore extends TypedEmitter<ConversationEvents> {
     const now = new Date().toISOString()
     this.db
       .update(conversations)
-      .set({ sdkSessionId, sdkBackend: backend, sdkBoundAt: now, lastActiveAt: now })
+      // A newly bound session has no known-good resume point yet.
+      .set({
+        sdkSessionId,
+        sdkBackend: backend,
+        sdkBoundAt: now,
+        sdkResumeAt: null,
+        lastActiveAt: now,
+      })
       .where(
         and(
           eq(conversations.id, conversationId),
@@ -283,6 +290,33 @@ export class ConversationStore extends TypedEmitter<ConversationEvents> {
           ),
         ),
       )
+      .run()
+  }
+
+  /**
+   * Record where the next turn resumes (`resumeSessionAt`): the last assistant
+   * message of a successful turn, for the session that is still bound.
+   */
+  setSdkResumeAt(conversationId: string, sdkSessionId: string, resumeAt: string): void {
+    this.db
+      .update(conversations)
+      .set({ sdkResumeAt: resumeAt })
+      .where(
+        and(eq(conversations.id, conversationId), eq(conversations.sdkSessionId, sdkSessionId)),
+      )
+      .run()
+  }
+
+  /**
+   * Drop the SDK session binding: the next turn starts a fresh session. Used
+   * when a turn failed and there is no known-good point to resume at, so the
+   * failed request is never replayed (mutabl spec §9.3).
+   */
+  clearSdkSession(conversationId: string): void {
+    this.db
+      .update(conversations)
+      .set({ sdkSessionId: null, sdkBoundAt: null, sdkResumeAt: null })
+      .where(eq(conversations.id, conversationId))
       .run()
   }
 
@@ -463,6 +497,11 @@ export class ConversationStore extends TypedEmitter<ConversationEvents> {
   }
 
   /** Escape hatch for adapter / telemetry — don't use for business logic. */
+  /** One message row by id (job retry reads the original request text). */
+  getMessage(messageId: string): Message | undefined {
+    return this.db.select().from(messages).where(eq(messages.id, messageId)).get()
+  }
+
   getById(conversationId: string): Conversation | undefined {
     return this.db.select().from(conversations).where(eq(conversations.id, conversationId)).get()
   }

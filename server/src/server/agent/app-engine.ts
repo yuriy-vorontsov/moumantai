@@ -29,7 +29,11 @@ import type { ConversationStore } from '../conversations/store.js'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { toToolSchema } from './types.js'
+import { needsApproval, toToolSchema } from './types.js'
+
+/** Appended to destructive/external tool descriptions (mutabl spec §6.3). */
+export const APPROVAL_NOTE =
+  " Requires the user's approval: calling it files an approval request and does NOT perform the action; tell the user it is waiting for their approval and do not call it again."
 import { FaceRegistry } from './face-loader.js'
 import { appPaths } from '../workspace/home.js'
 import { bootApp } from './boot-app.js'
@@ -82,7 +86,15 @@ export interface BootedApp {
 /** Derive wire-safe tool schemas from the registry. Single source of truth. */
 /** Tool schemas offered to agents — UI-only tools are excluded. */
 export function getToolSchemas(app: BootedApp) {
-  return [...app.toolRegistry.values()].filter((t) => !t.uiOnly).map(toToolSchema)
+  return [...app.toolRegistry.values()]
+    .filter((t) => !t.uiOnly)
+    .map((t) => {
+      const schema = toToolSchema(t)
+      // Tell the model up front that this call only files an approval request.
+      return needsApproval(t)
+        ? { ...schema, description: `${schema.description}${APPROVAL_NOTE}` }
+        : schema
+    })
 }
 
 // ---------------------------------------------------------------------------

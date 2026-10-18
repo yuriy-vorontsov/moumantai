@@ -12,6 +12,7 @@ import navigateApp from './tools/navigate-app.js'
 import restoreRelease from './tools/restore-release.js'
 import mainFace from './faces/main.js'
 import releasesFace from './faces/releases.js'
+import jobsFace from './faces/jobs.js'
 
 export function createHomeDef(): AppDefinition {
   return {
@@ -23,7 +24,7 @@ export function createHomeDef(): AppDefinition {
       description: 'Your personal assistant',
     },
     tools: [talkToApp, listApps, navigateApp, restoreRelease],
-    faces: [mainFace, releasesFace],
+    faces: [mainFace, releasesFace, jobsFace],
     skill:
       'You are the home assistant. Route domain-specific requests to the appropriate app using talk_to_app. For general questions, respond directly.',
   }
@@ -38,7 +39,8 @@ export function createHomeDef(): AppDefinition {
 export function wireHomeTools(
   toolRegistry: Map<string, ToolDefinition>,
   deps: {
-    runDelegation: (appId: string, message: string) => Promise<unknown>
+    /** `conversationId` = the home turn's conversation (its job gates the delegated turn). */
+    runDelegation: (appId: string, message: string, conversationId?: string) => Promise<unknown>
     getAppList: () => { appId: string; name: string; description: string }[]
     /**
      * Per-device focus mutation. Called with the originating device's stable
@@ -61,8 +63,12 @@ export function wireHomeTools(
   if (talkTool) {
     toolRegistry.set('talk_to_app', {
       ...talkTool,
-      execute: async ({ params }) => {
-        const result = await deps.runDelegation(params.app_id as string, params.message as string)
+      execute: async ({ params, conversationId }) => {
+        const result = await deps.runDelegation(
+          params.app_id as string,
+          params.message as string,
+          conversationId,
+        )
         return { result }
       },
     })

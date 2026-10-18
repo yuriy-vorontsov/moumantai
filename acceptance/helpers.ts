@@ -50,19 +50,24 @@ export interface RunningServer {
   stop(): Promise<void>
 }
 
-/** Boot a server with a fresh home and only `appIds` (copied from apps/) installed. */
+/**
+ * Boot a server with a fresh home and only `appIds` (copied from apps/)
+ * installed. Pass `reuseHome` (a previous server's `home`) to restart on the
+ * same data instead — the restart scenarios (AT-16).
+ */
 export async function startServer(
   appIds: string[],
   opts: CreateAppServerOpts = {},
+  reuseHome?: string,
 ): Promise<RunningServer> {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mutabl-acceptance-'))
-  const home = path.join(root, 'home')
+  const home =
+    reuseHome ?? path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mutabl-acceptance-')), 'home')
   // The standard layout: installed apps live in <home>/apps-src, where the
   // release workflow keeps each app's active-release pointer.
   const appsDir = path.join(home, 'apps-src')
   fs.mkdirSync(appsDir, { recursive: true })
   // Copy (not symlink): a promote in a test must never write into the repo.
-  for (const id of appIds) {
+  for (const id of reuseHome ? [] : appIds) {
     fs.cpSync(path.join(REPO_APPS, id), path.join(appsDir, id), {
       recursive: true,
       filter: (src) => !src.includes(`${path.sep}node_modules`),
@@ -154,6 +159,16 @@ export function chat(c: TestClient, appId: string, text: string, dev = false): v
 }
 
 /**
+ * A pause point for a scripted turn: the turn stops at this event until
+ * `release()` — or ends if the turn is aborted (cancel, shutdown).
+ */
+export function hold(): { event: AgentEvent; release: () => void } {
+  let release!: () => void
+  const until = new Promise<void>((r) => (release = r))
+  return { event: { type: 'hold', until } as unknown as AgentEvent, release }
+}
+
+/**
  * Deterministic stand-in for the LLM: each `run()` replays the queued script
  * (tool calls block until the server submits the result, like the real
  * adapters). Records every turn and every tool result for assertions.
@@ -190,6 +205,14 @@ export class SpyAgentAdapter implements LLMAdapter {
     this.edit = null
     if (edit) await edit(request.cwd)
     for (const ev of events) {
+      if ((ev as { type: string }).type === 'hold') {
+        const aborted = new Promise<void>((r) =>
+          request.signal?.addEventListener('abort', () => r(), { once: true }),
+        )
+        await Promise.race([(ev as unknown as { until: Promise<void> }).until, aborted])
+        if (request.signal?.aborted) return
+        continue
+      }
       if (ev.type === 'toolCall') {
         const done = new Promise<ToolResult>((resolve) => this.pending.set(ev.callId, resolve))
         yield ev

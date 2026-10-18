@@ -24,7 +24,7 @@ import type { ConversationStore } from '../conversations/store.js'
 import type { FaceParamsStore } from './face-params-store.js'
 import type { SendFaceUpdate } from './face-refresh.js'
 import type { TurnQueue } from './turn-queue.js'
-import { AgentLoop } from './agent-loop.js'
+import { AgentLoop, type ToolGate } from './agent-loop.js'
 import { runBoundTurn } from './bound-turn.js'
 import { appPaths } from '../workspace/home.js'
 import { buildFaceContext } from './face-context.js'
@@ -47,6 +47,11 @@ export interface DelegationDeps {
    * reflected in the broadcast. When absent, faces refresh without params.
    */
   faceParamsStore?: FaceParamsStore
+  /**
+   * The parent job's gate (approvals, idempotency, tool events): a delegated
+   * turn acts for the same request, so the same rules apply (mutabl spec §6.3).
+   */
+  toolGate?: ToolGate
 }
 
 export async function runDelegation(
@@ -91,6 +96,7 @@ export async function runDelegation(
           appId,
           sendFaceUpdate,
           faceParamsStore: deps.faceParamsStore,
+          ...(deps.toolGate ? { toolGate: deps.toolGate } : {}),
         })
 
         const turn = await agentLoop.runTurn({

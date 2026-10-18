@@ -28,6 +28,27 @@ import { appIdToScope } from '@moumantai/protocol'
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Job-level control over every agent tool call (mutabl spec §6.3, §9.3): the
+ * single enforcement point for approvals and idempotency, shared by every
+ * backend. `before` may short-circuit with a result (the tool then does NOT
+ * run); otherwise `after` receives the real result.
+ */
+export interface ToolGate {
+  before(call: ToolGateCall): Promise<ToolResult | undefined>
+  after(call: ToolGateCall, result: ToolResult): void
+  /** A call to a tool that does not exist or is UI-only (denied). */
+  denied(name: string): void
+}
+
+export interface ToolGateCall {
+  name: string
+  args: Record<string, unknown>
+  tool: ToolDefinition
+  appId: string
+  db: BetterSQLite3Database
+}
+
 export interface AgentLoopDeps {
   adapter: LLMAdapter
   toolRegistry: Map<string, ToolDefinition>
@@ -65,6 +86,8 @@ export interface AgentLoopDeps {
    * absent, every face is resolved (legacy behavior).
    */
   getMountedFaceIds?: () => ReadonlySet<string>
+  /** Approval + idempotency + tool events for the job this turn belongs to. */
+  toolGate?: ToolGate
   /**
    * Mid-turn progress sink for the edit-agent's `TodoWrite` checklist.
    * The dev-turn path broadcasts a `ChatTodosUpdate` to previewing clients.
@@ -83,6 +106,8 @@ export interface AgentLoopResult {
    * to persist it alongside the conversation row for resume.
    */
   sdkSessionId?: string
+  /** From the adapter's `done` event: where the next turn may resume. */
+  resumeAt?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +174,20 @@ export class AgentLoop {
             const tool = found?.uiOnly ? undefined : found
             let result: ToolResult
 
-            if (tool) {
+            const call: ToolGateCall | undefined = tool
+              ? {
+                  name: event.name,
+                  args: event.args,
+                  tool,
+                  appId: this.deps.appId,
+                  db: this.deps.db,
+                }
+              : undefined
+            const gated = call ? await this.deps.toolGate?.before(call) : undefined
+
+            if (gated) {
+              result = gated
+            } else if (tool) {
               // LLM-direct: default isUIInvocation=false so missing required
               // args surface as normal errors rather than escalations.
               result = await executeTool(tool, event.args, {
@@ -164,7 +202,9 @@ export class AgentLoop {
                 config: this.deps.config,
                 setContext: this.deps.setContext,
               })
+              this.deps.toolGate?.after(call!, result)
             } else {
+              this.deps.toolGate?.denied(event.name)
               result = { result: null, error: `Unknown tool: ${event.name}` }
             }
 
@@ -201,13 +241,21 @@ export class AgentLoop {
           }
 
           case 'done':
-            return { text: accumulatedText.trim(), toolCalls, success: true, sdkSessionId }
+            return {
+              text: accumulatedText.trim(),
+              toolCalls,
+              success: true,
+              sdkSessionId,
+              ...(event.resumeAt ? { resumeAt: event.resumeAt } : {}),
+            }
 
           case 'error':
             return { text: event.message, toolCalls, success: false, sdkSessionId }
         }
       }
 
+      // Canceled while the stream was idle: the run did not complete.
+      if (this.cancelRequested) return { text: '', toolCalls, success: false, sdkSessionId }
       // Stream ended without explicit 'done' — treat as done
       return { text: accumulatedText.trim(), toolCalls, success: true, sdkSessionId }
     } finally {

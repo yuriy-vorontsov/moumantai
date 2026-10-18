@@ -31,6 +31,11 @@ export interface AgentToolCallEvent {
 /** Turn completed successfully. */
 export interface AgentDoneEvent {
   type: 'done'
+  /**
+   * Backend message id the next turn may resume at (Claude: the last
+   * assistant message uuid of this successful turn). Absent when unknown.
+   */
+  resumeAt?: string
 }
 
 /** Turn terminated with an error. */
@@ -197,13 +202,42 @@ export interface ToolSchema {
 }
 
 /** Full tool definition. `execute` stays server-side; only `ToolSchema` is sent to the adapter. */
+/**
+ * What a tool call does to the world (mutabl spec §6.3). `read` never needs
+ * confirmation; `write` mutates app data; `destructive` (deletes, overwrites)
+ * and `external` (email, payments, publishing) need the user's explicit
+ * approval when an agent calls them. Absent = `write`.
+ */
+export type ToolRisk = 'read' | 'write' | 'destructive' | 'external'
+
 export interface ToolDefinition extends ToolSchema {
   execute: (ctx: ToolContext) => Promise<ToolResult>
+  /** See ToolRisk. Absent = 'write' (synthesized `view_*` tools are 'read'). */
+  risk?: ToolRisk
+  /**
+   * Human sentence for an approval request ("Delete task “Pay rent”").
+   * Called with the agent's arguments before anything runs; read-only.
+   */
+  approvalSummary?: (ctx: {
+    params: Record<string, unknown>
+    db: BetterSQLite3Database
+  }) => string | Promise<string>
   /**
    * UI-only tool: invocable from a face action, never offered to or callable
    * by an agent (owner controls like release restore). Framework-internal.
    */
   uiOnly?: boolean
+}
+
+/** Effective risk of a tool (synthesized view tools are reads). */
+export function toolRisk(tool: Pick<ToolDefinition, 'name' | 'risk'>): ToolRisk {
+  return tool.risk ?? (tool.name.startsWith('view_') ? 'read' : 'write')
+}
+
+/** True when an agent call must wait for the user's approval. */
+export function needsApproval(tool: Pick<ToolDefinition, 'name' | 'risk'>): boolean {
+  const risk = toolRisk(tool)
+  return risk === 'destructive' || risk === 'external'
 }
 
 /** Extract wire-safe ToolSchema from a ToolDefinition. */
@@ -454,6 +488,11 @@ export interface AgentRequest {
    * an `AgentSessionBoundEvent` so the caller can persist it.
    */
   sdkSessionId?: string
+  /**
+   * Resume only up to this backend message (the last successful turn), so a
+   * failed or interrupted request is not replayed (Claude: `resumeSessionAt`).
+   */
+  sdkResumeAt?: string
   /**
    * Optional label applied to the SDK session on first turn (via
    * `renameSession`). If omitted the adapter derives one from conversationId

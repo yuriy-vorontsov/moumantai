@@ -23,12 +23,15 @@ interface SdkBindingRow {
   sdkSessionId: string | null
   sdkBoundAt: string | null
   sdkBackend: string | null
+  sdkResumeAt?: string | null
 }
 
 /** Adapter-request fields that select the SDK session for a turn. */
 export interface SdkResumeArgs {
   sdkBound: boolean
   sdkSessionId?: string
+  /** Last known-good message to resume at (failed turns after it are dropped). */
+  sdkResumeAt?: string
 }
 
 /**
@@ -40,7 +43,11 @@ export interface SdkResumeArgs {
  */
 export function sdkResumeArgs(conv: SdkBindingRow, backend: string): SdkResumeArgs {
   if (conv.sdkSessionId !== null && conv.sdkBoundAt !== null && conv.sdkBackend === backend) {
-    return { sdkBound: true, sdkSessionId: conv.sdkSessionId }
+    return {
+      sdkBound: true,
+      sdkSessionId: conv.sdkSessionId,
+      ...(conv.sdkResumeAt ? { sdkResumeAt: conv.sdkResumeAt } : {}),
+    }
   }
   return { sdkBound: false }
 }
@@ -64,6 +71,25 @@ export interface BoundTurnDeps {
  * when the queue is full or the slot is aborted — callers map those to a
  * user-visible outcome.
  */
+/**
+ * After a turn: a success moves the resume point to its last message; a
+ * failure with no earlier good point unbinds the session, so the failed
+ * request is not replayed into the next turn (Phase 0 finding, spec §9.3).
+ */
+export function settleResumePoint(
+  store: ConversationStore,
+  conversationId: string,
+  result: { success: boolean; resumeAt?: string },
+): void {
+  const bound = store.getById(conversationId)
+  if (!bound?.sdkSessionId) return
+  if (result.success) {
+    if (result.resumeAt) store.setSdkResumeAt(conversationId, bound.sdkSessionId, result.resumeAt)
+  } else if (!bound.sdkResumeAt) {
+    store.clearSdkSession(conversationId)
+  }
+}
+
 export async function runBoundTurn(
   deps: BoundTurnDeps,
   build: (resume: SdkResumeArgs, signal: AbortSignal) => Promise<AgentLoopResult>,
@@ -76,6 +102,7 @@ export async function runBoundTurn(
       if (result.sdkSessionId) {
         deps.store.bindSdkSession(deps.conversationId, result.sdkSessionId, deps.backend)
       }
+      settleResumePoint(deps.store, deps.conversationId, result)
       return result
     },
   })

@@ -159,6 +159,8 @@ export class ClaudeAgentAdapter implements LLMAdapter {
       request.sdkBound && request.sdkSessionId ? request.sdkSessionId : crypto.randomUUID()
     if (request.sdkBound) {
       queryOptions.resume = sdkSessionId
+      // Cut off anything after the last successful turn (a failed request).
+      if (request.sdkResumeAt) queryOptions.resumeSessionAt = request.sdkResumeAt
     } else {
       queryOptions.sessionId = sdkSessionId
     }
@@ -267,6 +269,7 @@ export class ClaudeAgentAdapter implements LLMAdapter {
     // Accumulate assistant text silently; push one clean text event at the end.
     // Prefer result.result (final answer only) over accumulated intermediate text.
     let accumulatedText = ''
+    let lastAssistantUuid: string | undefined
     let sdkLabelApplied = false
     const tag = `[claude-adapter] conv=${conversationId.slice(0, 8)}`
 
@@ -369,6 +372,8 @@ export class ClaudeAgentAdapter implements LLMAdapter {
         // Accumulate assistant text. Also inspect tool_use blocks for the activity
         // log and the built-in TodoWrite checklist (forwarded as a progress event).
         if ((msg as { type?: string }).type === 'assistant' && 'message' in (msg as object)) {
+          const uuid = (msg as { uuid?: string }).uuid
+          if (uuid) lastAssistantUuid = uuid
           const assistantMsg = (msg as { message: unknown }).message as {
             content: Array<{
               type: string
@@ -418,7 +423,10 @@ export class ClaudeAgentAdapter implements LLMAdapter {
           if (finalText) {
             events.push({ type: 'text', text: finalText })
           }
-          events.push({ type: 'done' })
+          events.push({
+            type: 'done',
+            ...(lastAssistantUuid && !result.is_error ? { resumeAt: lastAssistantUuid } : {}),
+          })
           events.end()
           return
         }

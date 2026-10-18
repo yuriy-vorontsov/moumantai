@@ -564,6 +564,47 @@ describe('ClaudeAgentAdapter', () => {
       expect(lastOptions.sessionId).toBeUndefined()
     })
 
+    it('resumes at the last good message and reports the new one on success', async () => {
+      await adapter.connect({ type: 'claude' })
+      let lastOptions: any = null
+      queryBehavior = (opts) => {
+        lastOptions = opts.options
+        return sdkMessages([
+          { type: 'system', subtype: 'init', session_id: 'sdk-xyz' },
+          {
+            type: 'assistant',
+            uuid: 'tool-step',
+            message: { content: [{ type: 'text', text: 'a' }] },
+          },
+          {
+            type: 'assistant',
+            uuid: 'final-answer',
+            message: { content: [{ type: 'text', text: 'b' }] },
+          },
+          { type: 'result', is_error: false },
+        ])
+      }
+      const events = await collectEvents(
+        adapter,
+        makeRequest({ sdkBound: true, sdkSessionId: 'sdk-xyz', sdkResumeAt: 'msg-good' }),
+      )
+      expect(lastOptions.resume).toBe('sdk-xyz')
+      expect(lastOptions.resumeSessionAt).toBe('msg-good')
+      expect(events.at(-1)).toEqual({ type: 'done', resumeAt: 'final-answer' })
+
+      // A failed run reports no resume point.
+      queryBehavior = () =>
+        sdkMessages([
+          { type: 'assistant', uuid: 'half', message: { content: [{ type: 'text', text: 'x' }] } },
+          { type: 'result', is_error: true, errors: ['boom'] },
+        ])
+      const failed = await collectEvents(
+        adapter,
+        makeRequest({ sdkBound: true, sdkSessionId: 'sdk-xyz' }),
+      )
+      expect(failed.at(-1)).toEqual({ type: 'done' })
+    })
+
     it('emits sessionBound with the SDK-assigned id so caller can persist', async () => {
       await adapter.connect({ type: 'claude' })
       queryBehavior = () =>

@@ -65,6 +65,13 @@ import { createHomeDef, wireHomeTools } from './apps/home/index.js'
 import { setReleasesView } from './apps/home/faces/releases.js'
 import { buildReleasesView } from './releases/view.js'
 import { restoreRelease } from './releases/restore.js'
+import { JobStore } from './jobs/store.js'
+import { JobService } from './jobs/service.js'
+import { buildJobsView } from './jobs/view.js'
+import { JOB_UI_TOOLS, jobUiTools } from './jobs/ui-tools.js'
+import { setJobsView } from './apps/home/faces/jobs.js'
+import type { Job } from './jobs/schema.js'
+import { executeTool } from './agent/tool-executor.js'
 import {
   loadApps,
   reloadSingleApp,
@@ -296,6 +303,11 @@ export async function createAppServer(
   const store = new ConversationStore(platformDb)
   const changeRequestStore = new ChangeRequestStore(platformDb)
   const releaseStore = new ReleaseStore(platformDb)
+  const jobStore = new JobStore(platformDb)
+  /** Abort handles of running Developer Mode jobs (cancel_job → Stop). */
+  const devJobAborts = new Map<string, AbortController>()
+  /** draftId → its running Developer Mode job. */
+  const devJobByDraft = new Map<string, string>()
   const faceParamsStore = new FaceParamsStore(platformDb)
   const dedupStore = new DedupStore(platformDb)
   // Background sweep for stale dedup rows; cleared at server close.
@@ -427,6 +439,42 @@ export async function createAppServer(
         }),
       )
     }
+  }
+
+  // Agent Jobs (home face) is a global screen: pushed to every phone session on
+  // job changes, coalesced, not only to sessions viewing home (mutabl spec §9.2).
+  let jobsPushTimer: ReturnType<typeof setTimeout> | null = null
+  const pushJobsFace = (): void => {
+    const homeApp = appEngine.getApp('home')
+    if (!homeApp || !homeApp.faceRegistry.list().some((f) => f.id === 'jobs')) return
+    const data = homeApp.faceRegistry.resolveOne('jobs', {
+      db: homeApp.db,
+      paramsByFaceId: {},
+      context: homeApp.context,
+    })
+    for (const c of wsServer.getLiveConnections()) {
+      if (c.deviceClass !== DeviceClass.PHONE) continue
+      if (wsServer.isBackpressurePaused(c.sessionId)) continue
+      const selected = homeApp.faceRegistry.selectForSize('jobs', c.sizeClass)
+      wsServer.send(
+        c.sessionId,
+        msgFaceUpdate({
+          scope: 'home',
+          appId: 'home',
+          faceId: 'jobs',
+          components: filterComponentsForDevice(selected.components, c.deviceClass),
+          data,
+        }),
+      )
+    }
+  }
+  const notifyJobs = (): void => {
+    if (jobsPushTimer) return
+    jobsPushTimer = setTimeout(() => {
+      jobsPushTimer = null
+      pushJobsFace()
+    }, 100)
+    jobsPushTimer.unref?.()
   }
 
   // Faces currently mounted in this app's scope. Callers skip unmounted faces.
@@ -691,6 +739,19 @@ export async function createAppServer(
       )
       const ac = new AbortController()
       devInflight.set(draftId, ac)
+      // Developer Mode turns are jobs too (Agent Jobs shows them; Stop = cancel).
+      const devJob = jobService.create({
+        kind: 'dev_turn',
+        appId: liveAppId ?? meta.appId,
+        scope,
+        conversationId,
+        principal: wsServer.getDeviceId(sessionId) ?? 'local',
+        requestId: msg.clientMsgId ?? crypto.randomUUID(),
+        summary: msg.text,
+      })
+      jobService.begin(devJob.id)
+      devJobAborts.set(devJob.id, ac)
+      devJobByDraft.set(draftId, devJob.id)
       const t0 = Date.now()
       console.log(
         `[dev-turn] start draft=${draftId} conv=${conversationId.slice(0, 8)} kind=${kind} chars=${msg.text.length}`,
@@ -786,6 +847,12 @@ export async function createAppServer(
         // Mid-turn TodoWrite checklist → progress card. Same PHONE + active-scope
         // filter as the dev append bus, so todos never reach ESP32/Wear.
         onTodos: (todos) => {
+          const done = todos.filter((t) => t.status === 'completed').length
+          const current = todos.find((t) => t.status === 'in_progress')?.content
+          const line = `${done}/${todos.length} steps${current ? ` · ${current}` : ''}`
+          jobStore.setProgress(devJob.id, line)
+          jobStore.event(devJob.id, 'progress', { text: line })
+          notifyJobs()
           const todosMsg = msgChatTodosUpdate({ scope, conversationId, todos })
           for (const c of wsServer.getLiveConnections()) {
             if (
@@ -805,7 +872,21 @@ export async function createAppServer(
         const text = result.success ? result.text : result.text || '(edit-agent turn failed)'
         // Persist the assistant reply; the store 'append' bus broadcasts it to
         // PWA dev tabs with kind='dev' (the dev conversation is kind='dev').
-        store.appendTurn(conversationId, { role: 'assistant', text, turnMode: 'direct_user_chat' })
+        const replyRow = store.appendTurn(conversationId, {
+          role: 'assistant',
+          text,
+          turnMode: 'direct_user_chat',
+        })
+        jobService.finish(
+          devJob.id,
+          result.success
+            ? { ok: true, resultRef: replyRow.id }
+            : {
+                ok: false,
+                errorCode: ac.signal.aborted ? 'aborted' : 'agent_error',
+                errorMessage: text.slice(0, 300),
+              },
+        )
         if (ac.signal.aborted) {
           console.log(`[dev-turn] aborted draft=${draftId} durationMs=${Date.now() - t0}`)
         } else {
@@ -833,6 +914,11 @@ export async function createAppServer(
           `[dev-turn] failed draft=${draftId} durationMs=${Date.now() - t0}`,
           err instanceof Error ? err.message : err,
         )
+        jobService.finish(devJob.id, {
+          ok: false,
+          errorCode: ac.signal.aborted ? 'aborted' : 'internal_error',
+          errorMessage: err instanceof Error ? err.message : String(err),
+        })
         // Append an error row so the PWA dev tab clears its "thinking" indicator.
         // Skip on abort (conversation may have been archived by discard).
         if (!ac.signal.aborted) {
@@ -848,6 +934,8 @@ export async function createAppServer(
         }
       } finally {
         devInflight.delete(draftId)
+        devJobAborts.delete(devJob.id)
+        devJobByDraft.delete(draftId)
       }
     }
 
@@ -954,6 +1042,8 @@ export async function createAppServer(
 
     wsServer.onDraftTurnCancel((sessionId, m) => {
       if (rejectNonOwner(sessionId, m.draftId)) return
+      const devJobId = devJobByDraft.get(m.draftId)
+      if (devJobId) jobStore.requestCancel(devJobId, wsServer.getDeviceId(sessionId) ?? sessionId)
       devInflight.get(m.draftId)?.abort()
       wsServer.send(sessionId, msgDraftActionResult({ draftId: m.draftId, ok: true }))
     })
@@ -1198,8 +1288,10 @@ export async function createAppServer(
 
   // 8. Wire home tools with runtime deps
   const homeToolDeps = {
-    runDelegation: (appId: string, message: string) =>
-      runDelegation(appId, message, {
+    runDelegation: (appId: string, message: string, homeConversationId?: string) => {
+      // The delegated turn acts for the home turn's request: same job, same gate.
+      const parent = homeConversationId ? jobService.currentJobFor(homeConversationId) : undefined
+      return runDelegation(appId, message, {
         appEngine,
         adapter,
         store,
@@ -1208,7 +1300,9 @@ export async function createAppServer(
         backend: config.backend,
         home,
         faceParamsStore,
-      }),
+        ...(parent ? { toolGate: jobService.gateFor(parent) } : {}),
+      })
+    },
     getAppList: () =>
       appEngine
         .listApps()
@@ -1261,6 +1355,92 @@ export async function createAppServer(
     }),
   )
 
+  // Durable agent jobs (mutabl spec §9): records, approvals, cancel, retry.
+  const appName = (id: string) => appEngine.listApps().find((m) => m.id === id)?.name ?? id
+  const jobService = new JobService({
+    store: jobStore,
+    isOwner: (deviceId) => !config.pairingRequired || store.isDeviceOwner(deviceId),
+    // An approved agent action runs exactly as proposed, once, without the LLM.
+    runApprovedTool: async (approval, principal) => {
+      const app = await appEngine.use(approval.appId)
+      const tool = app.toolRegistry.get(approval.tool)
+      if (!tool || tool.uiOnly) {
+        return {
+          result: null,
+          error: `"${approval.tool}" is no longer available in ${appName(approval.appId)}.`,
+        }
+      }
+      const inv = jobStore.startInvocation({
+        jobId: approval.jobId,
+        appId: approval.appId,
+        tool: approval.tool,
+        risk: approval.risk,
+        inputHash: approval.inputHash,
+        idempotencyKey: `approval:${approval.id}`,
+      })
+      const result = await executeTool(tool, JSON.parse(approval.args) as Record<string, unknown>, {
+        db: app.db,
+        conversationId: approval.conversationId,
+        scope: appIdToScope(approval.appId),
+        originDeviceId: principal,
+        context: app.context,
+        config: app.config,
+        ...(app.httpClient ? { http: app.httpClient } : {}),
+        ...(app.assetCache ? { cacheAsset: app.assetCache } : {}),
+      })
+      jobStore.finishInvocation(
+        inv.id,
+        result.error ? 'error' : 'ok',
+        result.error ?? result.result,
+      )
+      broadcastFaces(
+        wsServer,
+        appEngine,
+        approval.appId,
+        wsServer.getLiveConnections(),
+        undefined,
+        draftRegistry,
+      )
+      return result
+    },
+    postNote: (conversationId, text) => {
+      try {
+        store.appendTurn(conversationId, { role: 'system', text })
+      } catch (err) {
+        console.warn('[jobs] note not posted:', err instanceof Error ? err.message : err)
+      }
+    },
+    recordDecision: (d) => {
+      releaseStore.approve({
+        principal: d.principal,
+        target: d.target,
+        contentHash: d.inputHash,
+        decision: d.decision,
+      })
+    },
+    rerunUserTurn: async (job, text, principal) => {
+      const sid = wsServer.getSessionByDeviceId(principal)
+      void runUserTurn(sid ?? '', job.scope, text, undefined, undefined, undefined, {
+        retryOf: job,
+        principal,
+      }).catch((err) => console.error('[jobs] retry failed to start:', err))
+    },
+    requestText: (job) => (job.messageId ? store.getMessage(job.messageId)?.text : undefined),
+    abortDevTurn: (job) => devJobAborts.get(job.id)?.abort(),
+    notify: notifyJobs,
+  })
+  {
+    const { interrupted } = jobService.recoverOnStartup()
+    if (interrupted > 0) console.log(`[startup] ${interrupted} agent job(s) need recovery`)
+  }
+  setJobsView(() => buildJobsView(jobStore, appName))
+
+  /** Approve/reject, cancel and retry — UI-only, on every app (see jobs/ui-tools.ts). */
+  function wireJobTools(appId: string): void {
+    for (const name of JOB_UI_TOOLS) appEngine.removeTool(appId, name)
+    for (const tool of jobUiTools(jobService)) appEngine.addTool(appId, tool)
+  }
+
   // 9a. setContext factory: writes context.json atomically and reloads
   // BootedApp.context in-place so subsequent turns see the new value.
   function makeSetContextFor(appId: string, schema: unknown) {
@@ -1311,6 +1491,7 @@ export async function createAppServer(
     // schema versions.
     wireSynthFaceTools({ appId, appEngine, faceParamsStore, transport })
     wireChangeRequestTool(appId)
+    wireJobTools(appId)
   }
 
   // 10. File watcher for hot-reload
@@ -1417,6 +1598,7 @@ export async function createAppServer(
       // Synth view tools (no-op for home today; keeps wiring symmetric).
       wireSynthFaceTools({ appId: 'home', appEngine, faceParamsStore, transport })
       wireChangeRequestTool('home')
+      wireJobTools('home')
     }
 
     // Register refresh tasks. swapApp re-fires this hook; unregisterApp
@@ -1906,6 +2088,8 @@ export async function createAppServer(
      * — users see their typed reply, not the synthetic context.
      */
     sdkContextPrefix?: string,
+    /** Retry of an earlier job (Agent Jobs → Retry); `principal` when no live session. */
+    jobOpts?: { retryOf?: Job; principal?: string },
   ): Promise<{ id: string; text: string; conversationId: string } | null> {
     const appId = scopeToAppId(scope) ?? 'home'
     const conv = store.getActive(scope)
@@ -1917,7 +2101,7 @@ export async function createAppServer(
 
     // User row first — broadcasts to every socket viewing `scope`. clientMsgId
     // deduplicates retries at the DB level. status defaults to 'pending'.
-    const originDeviceId = wsServer.getDeviceId(wsSessionId)
+    const originDeviceId = wsServer.getDeviceId(wsSessionId) ?? jobOpts?.principal
     const userRow = store.appendTurn(conv.id, {
       role: 'user',
       text: displayText,
@@ -1931,10 +2115,24 @@ export async function createAppServer(
       return { id: userRow.id, text: userRow.text, conversationId: conv.id }
     }
 
+    // Durable job for this turn (mutabl spec §9.1): QUEUED now, RUNNING in its slot.
+    const job = jobService.create({
+      kind: 'user_turn',
+      appId,
+      scope,
+      conversationId: conv.id,
+      principal: originDeviceId ?? 'local',
+      requestId: clientMsgId ?? userRow.id,
+      messageId: userRow.id,
+      summary: displayText,
+      retryOf: jobOpts?.retryOf ?? null,
+    })
+
     // Lazy-boot. Swallow errors — markTurnFailed surfaces them as a visible row.
     const app = await appEngine.use(appId).catch(() => null)
     if (!app) {
       store.markTurnFailed(userRow.id, 'internal_error')
+      jobService.finish(job.id, { ok: false, errorCode: 'app_unavailable' })
       return null
     }
 
@@ -1948,6 +2146,9 @@ export async function createAppServer(
     const turnPromise = runBoundTurn(
       { store, turnQueue, conversationId: conv.id, backend: config.backend },
       async (resume, signal) => {
+        // Canceled while it waited in the queue: do not run it.
+        const jobSignal = jobService.begin(job.id)
+        if (!jobSignal) return { text: '', toolCalls: [], success: false }
         store.markTurnRunning(userRow.id)
         const agentLoop = new AgentLoop({
           adapter,
@@ -1965,6 +2166,7 @@ export async function createAppServer(
           faceStaleness: (faceId, params) =>
             scheduler.getFaceStalenessOrNull(appId, faceId, params),
           getMountedFaceIds: () => mountedFaceIdsFor(appId),
+          toolGate: jobService.gateFor(job),
         })
 
         return agentLoop.runTurn({
@@ -1976,7 +2178,7 @@ export async function createAppServer(
           cwd,
           ...resume,
           ...(originDeviceId ? { originDeviceId } : {}),
-          signal,
+          signal: AbortSignal.any([signal, jobSignal]),
           context: {
             appId,
             manifest: app.manifest,
@@ -2010,6 +2212,7 @@ export async function createAppServer(
       if (timeoutId) clearTimeout(timeoutId)
       // The SDK session id is read and bound INSIDE runBoundTurn (in the
       // TurnQueue slot), not here — that's what closes the first-turn double-mint.
+      if (result.sdkSessionId) jobStore.setSdkSession(job.id, result.sdkSessionId)
 
       if (!result.success) {
         // {success:false}: abort signal fired (result.text empty) or adapter
@@ -2018,8 +2221,14 @@ export async function createAppServer(
         if (result.text && result.text.length > 0) {
           console.error('[turn] adapter failure', { scope, convId: conv.id, message: result.text })
           store.markTurnFailed(userRow.id, 'internal_error')
+          jobService.finish(job.id, {
+            ok: false,
+            errorCode: 'agent_error',
+            errorMessage: result.text.slice(0, 300),
+          })
         } else {
           store.markTurnFailed(userRow.id, 'aborted')
+          jobService.finish(job.id, { ok: false, errorCode: 'aborted' })
         }
         return null
       }
@@ -2031,11 +2240,26 @@ export async function createAppServer(
         toolCalls: result.toolCalls,
       })
       store.markTurnCompleted(userRow.id)
+      jobService.finish(job.id, { ok: true, resultRef: row.id })
       return { id: row.id, text: result.text, conversationId: conv.id }
     } catch (err) {
       if (timeoutId) clearTimeout(timeoutId)
 
       const name = err instanceof Error ? err.name : 'Unknown'
+      jobService.finish(job.id, {
+        ok: false,
+        errorCode:
+          name === 'SessionBusyError'
+            ? 'session_busy'
+            : name === 'AbortError'
+              ? 'aborted'
+              : name === 'TurnTimeoutError'
+                ? 'timeout'
+                : 'internal_error',
+        ...(name === 'TurnTimeoutError'
+          ? { errorMessage: 'The agent did not finish in time.' }
+          : {}),
+      })
 
       if (name === 'SessionBusyError') {
         // Throws before enqueue: user row is still 'pending', flip to failed.
@@ -2342,7 +2566,8 @@ export async function createAppServer(
       wsServer.getLiveConnections().find((c) => c.sessionId === sessionId),
       appId,
     )
-    if (previewed) {
+    // Job controls (approve, cancel, retry) act on live jobs even over a preview.
+    if (previewed && !(JOB_UI_TOOLS as readonly string[]).includes(msg.toolName)) {
       await invokeInDraft(sessionId, previewed, msg)
       return
     }
@@ -2370,6 +2595,17 @@ export async function createAppServer(
       // conversation, so this read is in-lock (and the matching bind in
       // action-handler is too) — which keeps escalation off the double-mint.
       const resume = sdkResumeArgs(store.getById(conv.id) ?? conv, config.backend)
+      // A form tap the agent completes is a job too: same gate, same approvals.
+      const escJob = jobService.create({
+        kind: 'escalation',
+        appId,
+        scope,
+        conversationId: conv.id,
+        principal: wsServer.getDeviceId(sessionId) ?? 'local',
+        requestId: msg.clientRequestId || crypto.randomUUID(),
+        summary: `${msg.toolName} (form needs more input)`,
+      })
+      const escSignal = jobService.begin(escJob.id)!
       const agentLoop = new AgentLoop({
         adapter,
         toolRegistry: app.toolRegistry,
@@ -2383,37 +2619,50 @@ export async function createAppServer(
         ...(app.httpClient ? { http: app.httpClient } : {}),
         ...(app.assetCache ? { cacheAsset: app.assetCache } : {}),
         getMountedFaceIds: () => mountedFaceIdsFor(appId),
+        toolGate: jobService.gateFor(escJob),
       })
-      const result = await agentLoop.runTurn({
-        conversationId: conv.id,
-        message: promptText,
-        mode: 'direct_user_chat',
-        tools: getToolSchemas(app),
-        cwd,
-        ...resume,
-        ...(signal ? { signal } : {}),
-        context: {
-          appId,
-          manifest: app.manifest,
-          schema: app.schema,
-          skill: app.skill,
-          turnMode: 'direct_user_chat',
-          deviceClass: client?.deviceClass ?? DeviceClass.PHONE,
-          ...(appId === 'home' && {
-            availableApps: appEngine
-              .listApps()
-              .filter((m) => m.id !== 'home')
-              .map((m) => ({ appId: m.id, name: m.name, description: m.description })),
-          }),
-          faces: buildFaceContext(app, conv.id, faceParamsStore),
-          ...(Object.keys(app.context).length > 0 && { context: app.context }),
-        },
-      })
+      const result = await agentLoop
+        .runTurn({
+          conversationId: conv.id,
+          message: promptText,
+          mode: 'direct_user_chat',
+          tools: getToolSchemas(app),
+          cwd,
+          ...resume,
+          signal: signal ? AbortSignal.any([signal, escSignal]) : escSignal,
+          context: {
+            appId,
+            manifest: app.manifest,
+            schema: app.schema,
+            skill: app.skill,
+            turnMode: 'direct_user_chat',
+            deviceClass: client?.deviceClass ?? DeviceClass.PHONE,
+            ...(appId === 'home' && {
+              availableApps: appEngine
+                .listApps()
+                .filter((m) => m.id !== 'home')
+                .map((m) => ({ appId: m.id, name: m.name, description: m.description })),
+            }),
+            faces: buildFaceContext(app, conv.id, faceParamsStore),
+            ...(Object.keys(app.context).length > 0 && { context: app.context }),
+          },
+        })
+        .catch((err: unknown) => {
+          jobService.finish(escJob.id, { ok: false, errorCode: 'internal_error' })
+          throw err
+        })
+      jobService.finish(
+        escJob.id,
+        result.success
+          ? { ok: true }
+          : { ok: false, errorCode: result.text ? 'agent_error' : 'aborted' },
+      )
       return {
         success: result.success,
         text: result.text,
         toolCalls: result.toolCalls,
         ...(result.sdkSessionId ? { sdkSessionId: result.sdkSessionId } : {}),
+        ...(result.resumeAt ? { resumeAt: result.resumeAt } : {}),
       }
     }
 
@@ -2445,6 +2694,8 @@ export async function createAppServer(
       dedupStore,
       conversationStore: store,
       conversationId: conv.id,
+      // A tap never waits behind a running agent turn (AT-14, spec §14.1).
+      queueKey: `ui:${conv.id}`,
       sourceFaceId: msg.sourceFaceId,
       clientRequestId: msg.clientRequestId,
       ...(msg.escalationPrompt !== undefined ? { escalationPrompt: msg.escalationPrompt } : {}),

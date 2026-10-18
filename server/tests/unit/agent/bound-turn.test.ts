@@ -17,26 +17,40 @@ const ok = (sdkSessionId?: string): AgentLoopResult => ({
  * bindSdkSession's write-once-per-backend semantics.
  */
 function fakeStore(
-  initial?: Partial<{ sdkSessionId: string; sdkBoundAt: string; sdkBackend: string }>,
+  initial?: Partial<{
+    sdkSessionId: string
+    sdkBoundAt: string
+    sdkBackend: string
+    sdkResumeAt: string
+  }>,
 ) {
   let row = {
     id: 'c1',
     sdkSessionId: (initial?.sdkSessionId ?? null) as string | null,
     sdkBoundAt: (initial?.sdkBoundAt ?? null) as string | null,
     sdkBackend: (initial?.sdkBackend ?? null) as string | null,
+    sdkResumeAt: (initial?.sdkResumeAt ?? null) as string | null,
   }
   const bindSdkSession = vi.fn((id: string, sid: string, backend: string) => {
     if (id !== row.id) return
     // write-once for the same backend; overwrite on backend change.
     if (row.sdkSessionId === null || row.sdkBackend !== backend) {
-      row = { ...row, sdkSessionId: sid, sdkBoundAt: 'now', sdkBackend: backend }
+      row = { ...row, sdkSessionId: sid, sdkBoundAt: 'now', sdkBackend: backend, sdkResumeAt: null }
     }
+  })
+  const clearSdkSession = vi.fn(() => {
+    row = { ...row, sdkSessionId: null, sdkBoundAt: null, sdkResumeAt: null }
+  })
+  const setSdkResumeAt = vi.fn((_id: string, sid: string, at: string) => {
+    if (row.sdkSessionId === sid) row = { ...row, sdkResumeAt: at }
   })
   const store = {
     getById: (id: string) => (id === row.id ? { ...row } : undefined),
     bindSdkSession,
+    clearSdkSession,
+    setSdkResumeAt,
   } as unknown as ConversationStore
-  return { store, bindSdkSession, current: () => row }
+  return { store, bindSdkSession, clearSdkSession, current: () => row }
 }
 
 describe('sdkResumeArgs', () => {
@@ -88,13 +102,35 @@ describe('runBoundTurn', () => {
     expect(bindSdkSession).toHaveBeenCalledWith('c1', 'NEW', 'claude')
   })
 
-  it('binds on init even when the turn fails mid-stream (bind-on-init)', async () => {
-    const { bindSdkSession, store } = fakeStore()
+  it('a failed first turn leaves no binding, so its request is not replayed next turn', async () => {
+    const { bindSdkSession, clearSdkSession, store, current } = fakeStore()
     await runBoundTurn(
       { store, turnQueue: new TurnQueue(), conversationId: 'c1', backend: 'claude' },
       async () => ({ text: 'boom', toolCalls: [], success: false, sdkSessionId: 'PARTIAL' }),
     )
     expect(bindSdkSession).toHaveBeenCalledWith('c1', 'PARTIAL', 'claude')
+    expect(clearSdkSession).toHaveBeenCalledWith('c1')
+    expect(current().sdkSessionId).toBeNull()
+  })
+
+  it('a successful turn records its resume point; a later failure resumes there', async () => {
+    const { store, current } = fakeStore()
+    const deps = { store, turnQueue: new TurnQueue(), conversationId: 'c1', backend: 'claude' }
+    await runBoundTurn(deps, async () => ({ ...ok('S1'), resumeAt: 'msg-1' }))
+    expect(current()).toMatchObject({ sdkSessionId: 'S1', sdkResumeAt: 'msg-1' })
+
+    // A failed turn keeps the binding and the earlier good point…
+    await runBoundTurn(deps, async () => ({ text: 'boom', toolCalls: [], success: false }))
+    expect(current()).toMatchObject({ sdkSessionId: 'S1', sdkResumeAt: 'msg-1' })
+
+    // …and the next turn resumes AT that point (the failed request is cut off).
+    let seen: SdkResumeArgs | undefined
+    await runBoundTurn(deps, async (resume) => {
+      seen = resume
+      return { ...ok(), resumeAt: 'msg-3' }
+    })
+    expect(seen).toEqual({ sdkBound: true, sdkSessionId: 'S1', sdkResumeAt: 'msg-1' })
+    expect(current().sdkResumeAt).toBe('msg-3')
   })
 
   it('two concurrent first turns converge on one session (no double-mint)', async () => {

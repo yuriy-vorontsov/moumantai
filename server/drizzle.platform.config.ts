@@ -7,6 +7,7 @@ export default defineConfig({
     './src/server/drafts/promotions-schema.ts',
     './src/server/change-requests/schema.ts',
     './src/server/releases/schema.ts',
+    './src/server/jobs/schema.ts',
   ],
   out: './drizzle/platform',
   casing: 'snake_case',

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { handleInvokeTool } from '../../../src/server/agent/action-handler.js'
 import { FaceRegistry } from '../../../src/server/agent/face-loader.js'
 import type { ToolDefinition } from '../../../src/server/agent/types.js'
+import { TurnQueue } from '../../../src/server/agent/turn-queue.js'
 
 function makeTool(name: string, executeFn?: ToolDefinition['execute']): ToolDefinition {
   return {
@@ -27,6 +28,40 @@ function makeDeps(tools: ToolDefinition[] = [], faces: FaceRegistry = new FaceRe
 }
 
 describe('handleInvokeTool', () => {
+  it('a tap on its own queue key does not wait behind a running agent turn (AT-14)', async () => {
+    const turnQueue = new TurnQueue()
+    let releaseTurn!: () => void
+    // An agent turn holds the conversation's slot.
+    const turn = turnQueue.enqueue('conv-1', {
+      run: () => new Promise<void>((r) => (releaseTurn = r)),
+    })
+    const { deps } = makeDeps([makeTool('add_task')])
+    const legacy = handleInvokeTool(
+      'add_task',
+      {},
+      { ...deps, turnQueue, conversationId: 'conv-1' },
+    )
+    const own = await handleInvokeTool(
+      'add_task',
+      {},
+      {
+        ...deps,
+        turnQueue,
+        conversationId: 'conv-1',
+        queueKey: 'ui:conv-1',
+      },
+    )
+    expect(own.error).toBeNull()
+    // The legacy key is still blocked until the turn ends.
+    let legacyDone = false
+    void legacy.then(() => (legacyDone = true))
+    await Promise.resolve()
+    expect(legacyDone).toBe(false)
+    releaseTurn()
+    await turn
+    expect((await legacy).error).toBeNull()
+  })
+
   it('executes matching tool and returns result on success', async () => {
     const tool = makeTool('increment', async ({ params }) => ({
       result: { newValue: ((params.current as number) ?? 0) + 1 },

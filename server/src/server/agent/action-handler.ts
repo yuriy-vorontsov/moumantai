@@ -20,6 +20,7 @@
  * <answer>` context and calls the mutation tool with typed values.
  */
 
+import { settleResumePoint } from './bound-turn.js'
 import type { ToolDefinition, ToolResult, HttpClient, StalenessRecord } from './types.js'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import type { FaceRegistry } from './face-loader.js'
@@ -67,6 +68,8 @@ export interface EscalationTurnResult {
   success: boolean
   text: string
   sdkSessionId?: string
+  /** Where the next turn may resume (see AgentLoopResult.resumeAt). */
+  resumeAt?: string
   toolCalls: { name: string; args: Record<string, unknown>; result: unknown }[]
 }
 export type RunEscalationTurn = (
@@ -133,6 +136,13 @@ export interface HandleInvokeToolDeps {
    * runs without those guarantees (mostly relevant in tests).
    */
   conversationId?: string
+  /**
+   * TurnQueue key for the tap itself. Production passes `ui:<conversationId>`
+   * so a deterministic tap never waits behind a running agent turn (mutabl
+   * spec §14.1, AT-14); an escalation still takes the conversation's slot.
+   * Defaults to `conversationId` (legacy: taps serialize with agent turns).
+   */
+  queueKey?: string
   /**
    * The store the escalation branch appends the assistant question to;
    * also broadcasts to every socket viewing the conversation's scope via
@@ -300,9 +310,10 @@ export async function handleInvokeTool(
     return executeAndRecord(toolName, args, deps)
   }
 
-  if (deps.turnQueue && deps.conversationId) {
+  const queueKey = deps.queueKey ?? deps.conversationId
+  if (deps.turnQueue && queueKey) {
     try {
-      return await deps.turnQueue.enqueue(deps.conversationId, {
+      return await deps.turnQueue.enqueue(queueKey, {
         run: () => task(),
       })
     } catch (err) {
@@ -527,7 +538,19 @@ async function escalateMissing(
     // LLM path: drive one agent turn that produces the assistant question.
     let turn: EscalationTurnResult
     try {
-      turn = await deps.runEscalationTurn!(syntheticPrompt, abort.signal)
+      // The escalation drives the conversation's agent session, so it takes the
+      // conversation's slot even when the tap itself ran on a separate UI key.
+      const onOwnKey =
+        deps.queueKey !== undefined &&
+        deps.queueKey !== deps.conversationId &&
+        deps.turnQueue &&
+        deps.conversationId
+      turn = onOwnKey
+        ? await deps.turnQueue!.enqueue(deps.conversationId!, {
+            run: (slot) =>
+              deps.runEscalationTurn!(syntheticPrompt, AbortSignal.any([abort.signal, slot])),
+          })
+        : await deps.runEscalationTurn!(syntheticPrompt, abort.signal)
     } catch (err) {
       return {
         result: null,
@@ -536,6 +559,9 @@ async function escalateMissing(
       }
     }
     if (!turn.success) {
+      if (deps.conversationStore && deps.conversationId) {
+        settleResumePoint(deps.conversationStore, deps.conversationId, turn)
+      }
       return {
         result: null,
         deduped: false,
@@ -579,6 +605,9 @@ async function escalateMissing(
       } catch (err) {
         console.warn('[handleInvokeTool] bindSdkSession failed:', err)
       }
+    }
+    if (deps.conversationStore && deps.conversationId) {
+      settleResumePoint(deps.conversationStore, deps.conversationId, turn)
     }
 
     // Record dedup so a retap replays the same outcome (no second LLM turn).

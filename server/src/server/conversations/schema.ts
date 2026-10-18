@@ -56,6 +56,13 @@ export const conversations = sqliteTable(
      * are backfilled with 'claude' by migration.
      */
     sdkBackend: text('sdk_backend'),
+    /**
+     * SDK message uuid of the last assistant reply of a SUCCESSFUL turn. The
+     * next turn resumes at this point (`resumeSessionAt`), so a failed or
+     * interrupted request is never replayed into the model's context
+     * (mutabl spec §9.3; Phase 0 finding). Null = no successful turn yet.
+     */
+    sdkResumeAt: text('sdk_resume_at'),
     /** ISO-8601 set on reset; never cleared. Archived rows are never deleted. */
     archivedAt: text('archived_at'),
     lastActiveAt: text('last_active_at')
