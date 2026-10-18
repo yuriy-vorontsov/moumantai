@@ -37,6 +37,7 @@ import {
   ClaudeAgentAdapter,
   buildZodSchema,
   isAnthropicImageMime,
+  makeAllowlistHook,
 } from '../../../../src/server/agent/claude/adapter.js'
 import { buildSystemPrompt } from '../../../../src/server/agent/system-prompt.js'
 
@@ -361,7 +362,7 @@ describe('ClaudeAgentAdapter', () => {
       expect(captured!.allowDangerouslySkipPermissions).toBeUndefined()
     })
 
-    it('app-agent path is unchanged: no builtinTools/hooks → tools:[] (MCP-only)', async () => {
+    it('app-agent profile: no builtinTools → tools:[] (MCP-only), dontAsk + allowlist hook', async () => {
       await adapter.connect({ type: 'claude' })
       let captured: Record<string, unknown> | undefined
       queryBehavior = (opts) => {
@@ -373,9 +374,9 @@ describe('ClaudeAgentAdapter', () => {
       }
       await collectEvents(adapter, makeRequest()) // plain app-agent request
       expect(captured!.tools).toEqual([])
-      expect(captured!.hooks).toBeUndefined()
-      expect(captured!.permissionMode).toBe('bypassPermissions')
-      expect(captured!.allowDangerouslySkipPermissions).toBe(true)
+      expect(captured!.hooks).toHaveProperty('PreToolUse')
+      expect(captured!.permissionMode).toBe('dontAsk')
+      expect(captured!.allowDangerouslySkipPermissions).toBeUndefined()
     })
 
     // Regression: hooks/canUseTool are delivered over the SDK control protocol, which only
@@ -409,7 +410,9 @@ describe('ClaudeAgentAdapter', () => {
       )
     })
 
-    it('app-agent (no hooks, no attachments) keeps the bare-string prompt', async () => {
+    it('app-agent uses streaming input so its allowlist hook is delivered', async () => {
+      // The SDK ignores hooks with a bare-string prompt; the app-agent always
+      // carries the allowlist PreToolUse hook, so it must stream.
       await adapter.connect({ type: 'claude' })
       let capturedPrompt: unknown
       queryBehavior = (opts) => {
@@ -420,7 +423,10 @@ describe('ClaudeAgentAdapter', () => {
         ])
       }
       await collectEvents(adapter, makeRequest({ message: 'hello' }))
-      expect(capturedPrompt).toBe('hello')
+      expect(typeof capturedPrompt).not.toBe('string')
+      expect((capturedPrompt as AsyncIterable<unknown>)[Symbol.asyncIterator]).toBeTypeOf(
+        'function',
+      )
     })
   })
 
@@ -658,7 +664,7 @@ describe('ClaudeAgentAdapter', () => {
         'mcp__moumantai__add_expense',
         'mcp__moumantai__query_expenses',
       ])
-      expect(lastOptions.permissionMode).toBe('bypassPermissions')
+      expect(lastOptions.permissionMode).toBe('dontAsk')
       expect(lastOptions.settingSources).toEqual([])
       expect(lastOptions.maxTurns).toBe(10)
     })
@@ -813,5 +819,28 @@ describe('buildSystemPrompt', () => {
       [],
     )
     expect(prompt).toContain('delegated from the home assistant')
+  })
+})
+
+describe('makeAllowlistHook (app-agent PreToolUse)', () => {
+  const hook = makeAllowlistHook(['mcp__moumantai__add_task', 'mcp__moumantai__query_tasks'])
+  const decide = async (tool: string) =>
+    (await hook.PreToolUse[0]!.hooks[0]!({ tool_name: tool })).hookSpecificOutput.permissionDecision
+
+  it('allows the app tools it was given', async () => {
+    expect(await decide('mcp__moumantai__add_task')).toBe('allow')
+  })
+
+  it.each([
+    'Bash',
+    'Write',
+    'Edit',
+    'Read',
+    'WebFetch',
+    'mcp__edit__request_promote_review',
+    'mcp__moumantai__add_expense',
+    'request_promote_review',
+  ])('denies %s', async (tool) => {
+    expect(await decide(tool)).toBe('deny')
   })
 })

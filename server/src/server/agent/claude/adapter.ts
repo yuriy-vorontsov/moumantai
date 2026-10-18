@@ -100,7 +100,10 @@ export class ClaudeAgentAdapter implements LLMAdapter {
     // Query options — each field falls back to app-agent defaults when unset.
     const systemPrompt =
       request.systemPromptOverride ?? buildSystemPrompt(request.context, request.tools)
-    const permissionMode = request.permissionMode ?? 'bypassPermissions'
+    // App-agent (User Mode) default: 'dontAsk' = deny anything not pre-approved
+    // via `allowedTools`, plus the allowlist PreToolUse hook below. The server's
+    // AgentLoop remains the authoritative gate (unknown tool → error).
+    const permissionMode = request.permissionMode ?? 'dontAsk'
     const queryOptions: Record<string, unknown> = {
       systemPrompt,
       maxTurns: request.maxTurns ?? 10,
@@ -120,7 +123,7 @@ export class ClaudeAgentAdapter implements LLMAdapter {
       queryOptions.tools = [] as string[]
     }
     // bypassPermissions requires the explicit dangerous-skip flag (SDK contract).
-    // 'dontAsk' (edit-agent) does NOT — it denies anything not pre-approved.
+    // 'dontAsk' (app-agent + edit-agent) does NOT — it denies anything not pre-approved.
     if (permissionMode === 'bypassPermissions') {
       queryOptions.allowDangerouslySkipPermissions = true
     }
@@ -140,6 +143,11 @@ export class ClaudeAgentAdapter implements LLMAdapter {
       if (!request.allowedTools) {
         queryOptions.allowedTools = request.tools.map((t) => `mcp__${mcpServerName}__${t.name}`)
       }
+    }
+    // App-agent defense in depth: without a caller-supplied hook (the edit-agent
+    // brings its own path policy), deny every tool outside the app's allowlist.
+    if (!request.hooks) {
+      queryOptions.hooks = makeAllowlistHook((queryOptions.allowedTools as string[]) ?? [])
     }
 
     // SDK session binding: `sessionId` (create) and `resume` are mutually exclusive.
@@ -651,4 +659,36 @@ function buildMultimodalPrompt(
       } as SDKUserMessage
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// App-agent tool allowlist (PreToolUse)
+// ---------------------------------------------------------------------------
+
+/**
+ * PreToolUse hook for the app-agent (User Mode): allow exactly the app's MCP
+ * tools, deny everything else (built-ins like Bash/Write/Edit, other MCP
+ * servers, unknown names). Logged so denials are observable.
+ */
+export function makeAllowlistHook(allowed: readonly string[]) {
+  const allow = new Set(allowed)
+  const callback = async (input: { tool_name: string }) => {
+    if (allow.has(input.tool_name)) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse' as const,
+          permissionDecision: 'allow' as const,
+        },
+      }
+    }
+    if (!process.env.VITEST) console.warn(`[app-agent-policy] DENY tool=${input.tool_name}`)
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse' as const,
+        permissionDecision: 'deny' as const,
+        permissionDecisionReason: `Tool "${input.tool_name}" is not available in this app.`,
+      },
+    }
+  }
+  return { PreToolUse: [{ hooks: [callback] }] }
 }
