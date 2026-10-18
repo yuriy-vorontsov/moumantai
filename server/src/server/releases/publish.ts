@@ -31,6 +31,22 @@ export function pointerPath(home: string, appId: string): string {
   return path.join(homeLayout(home).appsSrcDir, appId)
 }
 
+/**
+ * True when `appDir` is a release pointer (a symlink into `<home>/releases`).
+ * Such apps are immutable: only publish/restore activate them, with a fresh
+ * bundle — a file-watcher reload would re-import stale cached modules.
+ */
+export function isReleaseManaged(home: string, appDir: string): boolean {
+  try {
+    if (!fs.lstatSync(appDir).isSymbolicLink()) return false
+    const root = path.join(home, 'releases')
+    const realRoot = fs.existsSync(root) ? fs.realpathSync(root) : root
+    return fs.realpathSync(appDir).startsWith(realRoot + path.sep)
+  } catch {
+    return false
+  }
+}
+
 /** Copy `srcDir`'s release files into a new artifact; returns its dir + hash. */
 export function createArtifact(
   home: string,

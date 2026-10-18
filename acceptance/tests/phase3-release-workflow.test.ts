@@ -51,6 +51,7 @@ import {
   addFailingTest,
   bumpVersion,
   requireEngine,
+  rewordAddTask,
 } from '../fixtures/changes.js'
 
 const OWNER = 'acceptance-owner-device-000000000003'
@@ -445,4 +446,20 @@ describe('AT-08/10: publish, then restore', () => {
     ).toContainEqual(['RESTORED', OWNER_HOME])
     home.close()
   }, 60_000)
+})
+
+describe('publish of a modified file at an unchanged path', () => {
+  it('the live tool is the published one (fresh bundle, no stale module)', async () => {
+    const text = 'Add a task (reworded in a published release).'
+    const draftId = await developerTurn('Reword the add_task description', (dir) => {
+      rewordAddTask(dir, text)
+      bumpVersion(dir, '0.2.0', '0.3.1')
+    })
+    expect(await draftAction('draftPromote', draftId)).toEqual({ ok: true })
+    // Let any file-watcher event settle (debounce 300 ms) before checking.
+    await new Promise((r) => setTimeout(r, 1500))
+    const live = server.components.appEngine.getApp('todo')!
+    expect(live.manifest.version).toBe('0.3.1')
+    expect(live.toolRegistry.get('add_task')!.description).toBe(text)
+  }, 180_000)
 })

@@ -97,7 +97,7 @@ import {
   type PipelineContext,
   type PipelineResult,
 } from './releases/pipeline.js'
-import { pointerPath } from './releases/publish.js'
+import { isReleaseManaged, pointerPath } from './releases/publish.js'
 import { ENGINE_VERSION } from './workspace/apps-installer.js'
 import type { ChangeRequest } from './change-requests/schema.js'
 import { createHttpClient } from './framework/http-client.js'
@@ -1319,6 +1319,11 @@ export async function createAppServer(
     const reloadingApps = new Set<string>()
 
     const handleReload = async (appDir: string, action: string) => {
+      // Release-managed apps are immutable: a watcher event is the pointer switch
+      // that publish/restore already activated with a fresh bundle. Reloading
+      // here re-imports stale transitive modules from the ESM cache (same
+      // symlinked paths) over the new release (found live in Phase 4).
+      if (isReleaseManaged(home, appDir)) return
       const appName = appDir.split(/[\\/]/).pop()!
       if (reloadingApps.has(appName)) return
       reloadingApps.add(appName)

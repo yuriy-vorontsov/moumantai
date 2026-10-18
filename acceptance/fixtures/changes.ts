@@ -79,3 +79,12 @@ export function addDestructiveMigration(dir: string): void {
   })
   fs.writeFileSync(journalFile, JSON.stringify(journal, null, 2))
 }
+
+/** Reword an existing tool (a modified file at an unchanged path). */
+export function rewordAddTask(dir: string, description: string): void {
+  edit(
+    path.join(dir, 'tools', 'add-task.ts'),
+    /description: '[^']*',/,
+    `description: ${JSON.stringify(description)},`,
+  )
+}

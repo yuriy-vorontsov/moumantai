@@ -9,6 +9,7 @@ import { ReleaseStore } from '../../../src/server/releases/store.js'
 import {
   createArtifact,
   ensureBaseline,
+  isReleaseManaged,
   pointerPath,
   restoreIncompatibility,
   switchPointer,
@@ -116,6 +117,19 @@ describe('artifacts + pointer', () => {
 
     expect(switchPointer(home, 'todo', b)).toBe(a)
     expect(fs.readFileSync(path.join(link, 'index.ts'), 'utf8')).toBe('b')
+  })
+
+  it('only a pointer into <home>/releases is release-managed (the watcher skips it)', () => {
+    const link = pointerPath(home, 'todo')
+    fs.mkdirSync(link, { recursive: true })
+    expect(isReleaseManaged(home, link)).toBe(false) // a real dir (git/local install)
+    const repo = makeSource('repo', { 'index.ts': 'x' })
+    fs.rmSync(link, { recursive: true })
+    fs.symlinkSync(repo, link)
+    expect(isReleaseManaged(home, link)).toBe(false) // a dev symlink into a checkout
+    const a = createArtifact(home, 'todo', '0.2.0', repo)
+    switchPointer(home, 'todo', a.artifactDir)
+    expect(isReleaseManaged(home, link)).toBe(true)
   })
 
   it('ensureBaseline captures the running source once and makes it the active release', () => {
