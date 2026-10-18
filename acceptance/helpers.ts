@@ -46,6 +46,7 @@ const REPO_APPS = path.resolve(__dirname, '..', 'apps')
 export interface RunningServer {
   components: ServerComponents
   port: number
+  home: string
   stop(): Promise<void>
 }
 
@@ -55,8 +56,11 @@ export async function startServer(
   opts: CreateAppServerOpts = {},
 ): Promise<RunningServer> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mutabl-acceptance-'))
-  const appsDir = path.join(root, 'apps-src')
-  fs.mkdirSync(appsDir)
+  const home = path.join(root, 'home')
+  // The standard layout: installed apps live in <home>/apps-src, where the
+  // release workflow keeps each app's active-release pointer.
+  const appsDir = path.join(home, 'apps-src')
+  fs.mkdirSync(appsDir, { recursive: true })
   // Copy (not symlink): a promote in a test must never write into the repo.
   for (const id of appIds) {
     fs.cpSync(path.join(REPO_APPS, id), path.join(appsDir, id), {
@@ -67,7 +71,7 @@ export async function startServer(
 
   const components = await createAppServer({
     port: 0,
-    home: path.join(root, 'home'),
+    home,
     appDirs: [appsDir],
     ...opts,
   })
@@ -79,6 +83,7 @@ export async function startServer(
   return {
     components,
     port,
+    home,
     async stop() {
       components.appEngine.shutdown()
       await components.wsServer.close()
@@ -104,7 +109,9 @@ export async function connectTo(
     },
   })
   c.send(
-    create(ClientMessageSchema, { payload: { case: 'viewing', value: { scope: `app:${appId}` } } }),
+    create(ClientMessageSchema, {
+      payload: { case: 'viewing', value: { scope: appId === 'home' ? 'home' : `app:${appId}` } },
+    }),
   )
   await waitFor(c.received, (buf) =>
     buf.some((m) => m.payload.case === 'faceList' && m.payload.value.appId === appId),
@@ -155,10 +162,20 @@ export class SpyAgentAdapter implements LLMAdapter {
   readonly turns: AgentRequest[] = []
   readonly toolResults: ToolResult[] = []
   private script: AgentEvent[] = []
+  private edit: ((draftDir: string) => void | Promise<void>) | null = null
   private pending = new Map<string, (r: ToolResult) => void>()
 
   queue(events: AgentEvent[]): void {
     this.script = events
+  }
+
+  /**
+   * The next run() plays the Developer Agent: applies `apply` to its cwd (the
+   * draft worktree), then replies — the server auto-reloads the preview after.
+   */
+  queueEdit(apply: (draftDir: string) => void | Promise<void>, reply = 'Done.'): void {
+    this.edit = apply
+    this.script = [{ type: 'text', text: reply }, { type: 'done' }]
   }
 
   async connect(_config: BackendConfig): Promise<void> {}
@@ -169,6 +186,9 @@ export class SpyAgentAdapter implements LLMAdapter {
     this.turns.push(request)
     const events = this.script
     this.script = []
+    const edit = this.edit
+    this.edit = null
+    if (edit) await edit(request.cwd)
     for (const ev of events) {
       if (ev.type === 'toolCall') {
         const done = new Promise<ToolResult>((resolve) => this.pending.set(ev.callId, resolve))

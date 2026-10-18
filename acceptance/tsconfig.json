@@ -20,5 +20,6 @@
     }
   },
   "include": ["**/*.ts"],
-  "exclude": ["node_modules"]
+  // calendar-change/ holds app source copied into a draft (typechecked there).
+  "exclude": ["node_modules", "fixtures/calendar-change"]
 }
