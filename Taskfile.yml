@@ -62,7 +62,8 @@ tasks:
     desc: 'mutabl acceptance suite (spec AT-xx): real server + real apps over the WebSocket protocol'
     cmds:
       - npx tsc --noEmit -p acceptance/tsconfig.json
-      - npx vitest run --config acceptance/vitest.config.ts
+      # Run from server/ like the server itself (skills + repo root resolve from cwd/..).
+      - cd server && npx vitest run --config ../acceptance/vitest.config.ts
   format:
     desc: 'Auto-format every language: Prettier/ruff/clang-format (pre-commit) + Kotlin (Spotless via Gradle)'
     env: { PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }

@@ -10,6 +10,7 @@ import path from 'node:path'
 import type { AddressInfo } from 'net'
 import { create } from '@bufbuild/protobuf'
 import {
+  ChatKind,
   ClientMessageSchema,
   DeviceClass,
   DeviceShape,
@@ -48,7 +49,7 @@ export interface RunningServer {
   stop(): Promise<void>
 }
 
-/** Boot a server with a fresh home and only `appIds` (symlinked from apps/) installed. */
+/** Boot a server with a fresh home and only `appIds` (copied from apps/) installed. */
 export async function startServer(
   appIds: string[],
   opts: CreateAppServerOpts = {},
@@ -56,7 +57,13 @@ export async function startServer(
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mutabl-acceptance-'))
   const appsDir = path.join(root, 'apps-src')
   fs.mkdirSync(appsDir)
-  for (const id of appIds) fs.symlinkSync(path.join(REPO_APPS, id), path.join(appsDir, id))
+  // Copy (not symlink): a promote in a test must never write into the repo.
+  for (const id of appIds) {
+    fs.cpSync(path.join(REPO_APPS, id), path.join(appsDir, id), {
+      recursive: true,
+      filter: (src) => !src.includes(`${path.sep}node_modules`),
+    })
+  }
 
   const components = await createAppServer({
     port: 0,
@@ -84,11 +91,16 @@ export async function startServer(
 }
 
 /** Connect a phone client and focus it on `appId` (so UI invocations route there). */
-export async function connectTo(port: number, appId: string): Promise<TestClient> {
+export async function connectTo(
+  port: number,
+  appId: string,
+  deviceId?: string,
+): Promise<TestClient> {
   const c = await TestClient.connect(port, {
     hello: {
       deviceClass: DeviceClass.PHONE,
       deviceProfile: { width: 390, height: 844, shape: DeviceShape.RECT },
+      ...(deviceId ? { deviceId } : {}),
     },
   })
   c.send(
@@ -122,10 +134,14 @@ export function invokeTool(
   )
 }
 
-export function chat(c: TestClient, appId: string, text: string): void {
+/** Send a chat message; `dev` = the Developer Mode (edit-agent) thread. */
+export function chat(c: TestClient, appId: string, text: string, dev = false): void {
   c.send(
     create(ClientMessageSchema, {
-      payload: { case: 'chatInput', value: { scope: `app:${appId}`, text } },
+      payload: {
+        case: 'chatInput',
+        value: { scope: `app:${appId}`, text, ...(dev ? { kind: ChatKind.DEV } : {}) },
+      },
     }),
   )
 }
