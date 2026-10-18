@@ -8,6 +8,8 @@ export interface StatusHeaderProps {
   onThemeToggle: () => void
   themeMode: 'light' | 'dark'
   onSettingsOpen: () => void
+  /** Shown on Home when the server offers the Release History face. */
+  onReleasesOpen?: () => void
 }
 
 /**
@@ -19,6 +21,7 @@ export interface StatusHeaderProps {
  *     THINKING = breathe; SPEAKING = waveform-like quick pulse.
  *   - connection indicator (signal icon)
  *   - theme toggle
+ *   - release history (Home only, when available)
  *   - settings
  *
  * Icons are Material Symbols Rounded ligatures, sharing the M3 weight with
@@ -29,6 +32,7 @@ export function StatusHeader({
   onThemeToggle,
   themeMode,
   onSettingsOpen,
+  onReleasesOpen,
 }: StatusHeaderProps) {
   const status = useConnectionStore((s) => s.status)
   const voiceState = useChatStore((s) => s.voiceState)
@@ -41,6 +45,11 @@ export function StatusHeader({
         <IconButton onClick={onThemeToggle} aria-label="Toggle theme">
           {themeMode === 'dark' ? 'light_mode' : 'dark_mode'}
         </IconButton>
+        {onReleasesOpen && (
+          <IconButton onClick={onReleasesOpen} aria-label="Releases">
+            history
+          </IconButton>
+        )}
         <IconButton onClick={onSettingsOpen} aria-label="Settings">
           settings
         </IconButton>

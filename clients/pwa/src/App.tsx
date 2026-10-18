@@ -55,6 +55,7 @@ function roleLabel(role: ChatRole): ChatMessageDisplay['role'] {
 export default function App() {
   const [theme, setTheme] = useState<Theme>(readTheme)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [releasesOpen, setReleasesOpen] = useState(false)
   const [transportEpoch, setTransportEpoch] = useState(0)
   const [devModeEnabled, setDevModeEnabled] = useState(false)
   const transportRef = useRef<WebSocketTransport | null>(null)
@@ -347,6 +348,11 @@ export default function App() {
         onThemeToggle={toggleTheme}
         themeMode={theme}
         onSettingsOpen={() => setSettingsOpen(true)}
+        onReleasesOpen={
+          activeAppId === 'home' && apps.get('home')?.faceOrder.includes('releases')
+            ? () => setReleasesOpen(true)
+            : undefined
+        }
       />
       <ConnectionBanner
         onOpenSettings={() => setSettingsOpen(true)}
@@ -425,6 +431,10 @@ export default function App() {
           })}
         </AppShell>
       )}
+      {/* Home renders as full-screen chat, so its Release History face lives in a sheet. */}
+      <Sheet open={releasesOpen} onDismiss={() => setReleasesOpen(false)}>
+        <RenderNode componentId="root" surfaceId="home:releases" dispatch={dispatch} />
+      </Sheet>
       <Sheet open={settingsOpen} onDismiss={() => setSettingsOpen(false)} title="Settings">
         <SettingsFace onReconnect={handleReconnect} devModeAvailable={devModeEnabled} />
       </Sheet>
